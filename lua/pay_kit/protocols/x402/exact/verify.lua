@@ -187,7 +187,8 @@ local function verify_transfer(ix, account_keys, requirement, managed_signers)
     error('invalid_exact_svm_payload_recipient_mismatch')
   end
 
-  -- Rule 8: amount match. Compare as exact unsigned decimals so a
+  -- Rule 8: scheme_exact_svm §1.4, the matching transfer is "at least" the
+  -- required amount (overpayment tolerated, less rejected). Compare as exact unsigned decimals so a
   -- full-range u64 amount cannot collide with a different value through
   -- float rounding (mirrors Rust's u64 equality, verify.rs:414).
   local amount = read_u64_le(data, 2)
@@ -198,7 +199,7 @@ local function verify_transfer(ix, account_keys, requirement, managed_signers)
   if type(expected_amount) ~= 'string' or expected_amount == '' then
     error('invalid_exact_svm_payload_amount_mismatch')
   end
-  if uint.compare(amount, expected_amount) ~= 0 then
+  if uint.compare(amount, expected_amount) < 0 then
     error('invalid_exact_svm_payload_amount_mismatch')
   end
 
@@ -210,6 +211,26 @@ local function verify_transfer(ix, account_keys, requirement, managed_signers)
     authority   = authority,
     amount      = amount,
   }
+end
+
+-- scheme_exact_svm §2.1.1: the fee payer "MUST NOT appear in the `accounts`
+-- list of any instruction ... and MUST NOT be invoked as a program"
+-- (RULINGS S3). The transfer check above only covers ix[2]; this sweeps the
+-- optional Memo / Lighthouse slots too, so an extra instruction cannot name
+-- the sponsor as a signer.
+local function reject_fee_payer_in_any_instruction(instructions, account_keys, managed_signers)
+  local managed = {}
+  for i = 1, #managed_signers do managed[managed_signers[i]] = true end
+  for _, ix in ipairs(instructions) do
+    if managed[program_of(account_keys, ix)] then
+      error('invalid_exact_svm_payload_transaction_fee_payer_in_instruction_accounts')
+    end
+    for j = 1, #ix.accounts do
+      if managed[account_keys[ix.accounts[j] + 1]] then
+        error('invalid_exact_svm_payload_transaction_fee_payer_in_instruction_accounts')
+      end
+    end
+  end
 end
 
 local function find_memo_match(account_keys, instructions, expected_memo)
@@ -274,6 +295,9 @@ function M.verify(transaction_b64, requirement, managed_signers)
       error(reasons[slot_index + 1] or 'invalid_exact_svm_payload_unknown_optional_instruction')
     end
   end
+
+  reject_fee_payer_in_any_instruction(instructions, parsed.message.account_keys,
+                                      managed_signers)
 
   -- Rule 10: memo binding.
   local expected_memo = string_extra(requirement, 'memo', false)

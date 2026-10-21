@@ -52,6 +52,22 @@ pub enum Error {
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 
+    /// The challenge violates the charge method spec and the client refuses
+    /// it: `decimals` missing for a mint, or `tokenProgram` omitted and the
+    /// mint lookup failed or returned an owner that is not a token program.
+    #[error("Invalid challenge: {0}")]
+    InvalidChallenge(String),
+
+    /// The client declined a challenge whose splits set `ataCreationRequired`
+    /// while the client pays the fees (`PayerFundedAtaCreation::Decline`).
+    /// The spec requires the creation in that case, so the challenge is
+    /// refused rather than paid without it.
+    #[error(
+        "challenge declined: a split sets ataCreationRequired and the client is the fee payer, \
+         so the spec requires the client to fund that ATA rent, which this client declines"
+    )]
+    PayerFundedAtaCreationDeclined,
+
     #[error("Challenge expired at {0}")]
     ChallengeExpired(String),
 

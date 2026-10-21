@@ -122,7 +122,24 @@ final class Adapter
      */
     public function acceptsEntry(Gate $gate, ServerRequestInterface $request): array
     {
-        $coin = $gate->amount->primaryCoin()?->value ?? $this->config->stablecoins[0]->value;
+        return $this->offerFor($gate, $request->getUri()->getPath());
+    }
+
+    /**
+     * The route's x402 `exact` offer. `$resource`, when given, is bound into
+     * `extra.memo` so a payment built for one resource cannot be replayed
+     * against another (scheme_exact_svm §3.1: with `extra.memo` set, the
+     * facilitator verifies exactly one matching Memo).
+     *
+     * @return array<string,mixed>
+     */
+    private function offerFor(Gate $gate, ?string $resource): array
+    {
+        $stablecoin = $gate->amount->primaryCoin() ?? $this->config->stablecoins[0];
+        $coin = $stablecoin->value;
+        // `amount` is in atomic units of the asset (RULINGS X2): scale by the
+        // coin's own decimals. toInt() throws rather than round.
+        $decimals = $stablecoin->decimals();
         // x402 spec puts the on-chain mint pubkey on `asset`, not the
         // ticker. Resolve the ticker to a mint via the legacy Mints
         // registry; Mints::resolve already falls back to the mainnet
@@ -130,14 +147,19 @@ final class Adapter
         $asset = \PayKit\PayCore\Solana\Mints::resolve($coin, $this->config->network->mintsLabel()) ?? $coin;
         $tokenProgram = \PayKit\PayCore\Solana\Mints::tokenProgramFor($coin, $this->config->network->mintsLabel());
         $payTo = $gate->payTo ?? $this->config->effectiveRecipient();
-        $amount = (string) $gate->total()->amount->multipliedBy(1_000_000)->toInt();
+        $amount = (string) $gate->total()->amount->multipliedBy(\Brick\Math\BigDecimal::ten()->power($decimals))->toInt();
         $signer = $this->config->effectiveX402Signer();
+        // `decimals` and `tokenProgram` are non-spec hints: scheme_exact_svm
+        // defines feePayer, memo, recentBlockhash and lastValidBlockHeight
+        // only, and a client reads the mint (RULINGS S1).
         $extra = [
             'feePayer'     => $signer?->pubkey() ?? '',
-            'decimals'     => 6,
+            'decimals'     => $decimals,
             'tokenProgram' => $tokenProgram,
-            'memo'         => $request->getUri()->getPath(),
         ];
+        if ($resource !== null && $resource !== '') {
+            $extra['memo'] = $resource;
+        }
         // Ruby PR #142 caveat #5: stamp the server's recent_blockhash
         // into accepted.extra so pay-kit clients sign against the
         // same chain state the server will broadcast to. Closes the
@@ -154,8 +176,9 @@ final class Adapter
             'scheme'            => 'exact',
             'network'           => $this->caip2(),
             'asset'             => $asset,
+            // v2 `amount` only; `maxAmountRequired` is the v1 spelling and
+            // does not belong in a v2 PaymentRequirements (RULINGS X1).
             'amount'            => $amount,
-            'maxAmountRequired' => $amount,
             'payTo'             => $payTo,
             'maxTimeoutSeconds' => 60,
             'extra'             => $extra,
@@ -233,8 +256,47 @@ final class Adapter
             throw new InvalidProofException('pay_kit: payment required');
         }
 
+        ['envelope' => $envelope, 'payload' => $payload, 'transaction' => $txBase64, 'version' => $version]
+            = $this->verifyPaymentHeader($gate, $header, $request->getUri()->getPath());
+
+        // Cosign as facilitator.
+        $rawTx = base64_decode($txBase64, true);
+        if ($rawTx === false) {
+            throw new InvalidProofException('invalid_exact_svm_payload_base64');
+        }
+        try {
+            $tx = TransactionWire::deserialize($rawTx);
+        } catch (Throwable) {
+            throw new InvalidProofException('invalid_exact_svm_payload_transaction_parse');
+        }
+        $kp = Keypair::fromSecretKey($signer->secretKey());
+        $tx->partialSign($kp);
+        $cosignedWire = $tx->serialize(verifySignatures: false);
+
+        return $this->broadcastAndConfirm($header, $envelope, $payload, $version, $cosignedWire);
+    }
+
+    /**
+     * Pre-broadcast verification of a payment header against the gate's
+     * offer: version dispatch, requirement binding, the extensions gate and
+     * the structural Verifier over the decoded transaction (exactly one
+     * TransferChecked of `amount` of `asset` to the payTo ATA, fee payer kept
+     * out of every instruction, memo binding when the offer sets one). Reads
+     * no chain state and signs nothing; verifyAndSettle runs it first.
+     *
+     * `$resource` is the path bound into `extra.memo`; pass null for a route
+     * without a resource memo.
+     *
+     * @return array{envelope: array<string,mixed>, payload: array<string,mixed>, transaction: string, version: mixed}
+     */
+    public function verifyPaymentHeader(Gate $gate, string $header, ?string $resource): array
+    {
+        $signer = $this->config->effectiveX402Signer();
+        if ($signer === null) {
+            throw new InvalidProofException('pay_kit: x402 requires operator.signer');
+        }
         $envelope = $this->decodeCredential($header);
-        $offer    = $this->acceptsEntry($gate, $request);
+        $offer    = $this->offerFor($gate, $resource);
 
         // Version dispatch. The canonical wire commits to a full `accepted`
         // requirement object (identity-key matched below); the legacy wire
@@ -291,20 +353,15 @@ final class Adapter
         // Verify structural shape (11 rules).
         Verifier::verify($txBase64, $offer, [$signer->pubkey()]);
 
-        // Cosign as facilitator.
-        $rawTx = base64_decode($txBase64, true);
-        if ($rawTx === false) {
-            throw new InvalidProofException('invalid_exact_svm_payload_base64');
-        }
-        try {
-            $tx = TransactionWire::deserialize($rawTx);
-        } catch (Throwable) {
-            throw new InvalidProofException('invalid_exact_svm_payload_transaction_parse');
-        }
-        $kp = Keypair::fromSecretKey($signer->secretKey());
-        $tx->partialSign($kp);
-        $cosignedWire = $tx->serialize(verifySignatures: false);
+        return ['envelope' => $envelope, 'payload' => $payload, 'transaction' => $txBase64, 'version' => $version];
+    }
 
+    /**
+     * @param array<string,mixed> $envelope
+     * @param array<string,mixed> $payload
+     */
+    private function broadcastAndConfirm(string $header, array $envelope, array $payload, mixed $version, string $cosignedWire): Payment
+    {
         // Broadcast via the raw-wire path so PHP doesn't have to
         // reconstruct a SignedTransaction wrapper just to send.
         $rpc = $this->rpc();
@@ -436,9 +493,11 @@ final class Adapter
      *
      * The credential echoes the full `accepted` requirement it claims to be
      * paying for; we identity-key match it against the route's offer
-     * (scheme/network/asset/payTo + extra.feePayer/tokenProgram/memo) so a
+     * (scheme/network/amount/asset/payTo + extra.feePayer/memo) so a
      * credential that lies about its requirement is rejected before settlement.
-     * Mirrors the rust v2 arm + cross-SDK PR #138 alignment.
+     * `accepted` is the "PaymentRequirements object indicating the payment
+     * method chosen" (x402-specification-v2.md §5.2.2), and the chosen method
+     * includes its amount. maxTimeoutSeconds is informational and not compared.
      *
      * @param array<string, mixed> $envelope
      * @param array<string, mixed> $offer
@@ -449,7 +508,7 @@ final class Adapter
         if (!is_array($accepted)) {
             throw new InvalidProofException('invalid_exact_svm_payload_envelope');
         }
-        foreach (['scheme', 'network', 'asset', 'payTo'] as $key) {
+        foreach (['scheme', 'network', 'amount', 'asset', 'payTo'] as $key) {
             if (($accepted[$key] ?? null) !== ($offer[$key] ?? null)) {
                 throw new InvalidProofException(
                     'pay_kit: charge_request_mismatch: '
@@ -459,7 +518,10 @@ final class Adapter
         }
         $offerExtra    = $offer['extra']    ?? [];
         $acceptedExtra = $accepted['extra'] ?? [];
-        foreach (['feePayer', 'tokenProgram', 'memo'] as $key) {
+        // `tokenProgram` / `decimals` are non-spec hints a client may drop
+        // (RULINGS S1); the Verifier binds the transfer to the canonical token
+        // programs and re-derives the payTo ATA itself.
+        foreach (['feePayer', 'memo'] as $key) {
             if (array_key_exists($key, $offerExtra)
                 && ($acceptedExtra[$key] ?? null) !== $offerExtra[$key]) {
                 throw new InvalidProofException(

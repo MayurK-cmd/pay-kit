@@ -256,6 +256,7 @@ func TestVerifyCredentialTokenSignatureSuccess(t *testing.T) {
 	clientSigner := testutil.NewPrivateKey()
 	mint := testutil.NewPrivateKey().PublicKey()
 	rpcClient.MintOwners[mint.String()] = solana.TokenProgramID
+	rpcClient.MintDecimals[mint.String()] = 6
 	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient:      recipient.PublicKey().String(),
 		Currency:       mint.String(),
@@ -888,8 +889,8 @@ func TestNewWithDefaultValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
 	}
-	if handler.currency != "USDC" {
-		t.Fatalf("expected default currency USDC, got %q", handler.currency)
+	if handler.currency != paycore.USDCMainnetMint {
+		t.Fatalf("expected default currency USDC to resolve to the mainnet mint, got %q", handler.currency)
 	}
 	if handler.decimals != 6 {
 		t.Fatalf("expected default decimals 6, got %d", handler.decimals)
@@ -946,6 +947,7 @@ func TestVerifyCredentialTokenTransactionSuccess(t *testing.T) {
 	clientSigner := testutil.NewPrivateKey()
 	mint := testutil.NewPrivateKey().PublicKey()
 	rpcClient.MintOwners[mint.String()] = solana.TokenProgramID
+	rpcClient.MintDecimals[mint.String()] = 6
 	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient: recipient.PublicKey().String(),
 		Currency:  mint.String(),

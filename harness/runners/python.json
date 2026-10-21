@@ -1,6 +1,17 @@
 {
   "language": "python",
-  "command": ["uv", "run", "python", "conformance_runner.py"],
-  "cwd": "python",
-  "intents": ["charge", "x402-exact", "session"]
+  "command": [
+    "uv",
+    "run",
+    "python",
+    "conformance_runner.py"
+  ],
+  "serve": [
+    "uv",
+    "run",
+    "python",
+    "conformance_runner.py",
+    "--serve"
+  ],
+  "cwd": "python"
 }

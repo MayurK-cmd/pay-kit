@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import dataclasses
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -35,7 +36,8 @@ from solana_pay_kit._paycore.solana import (
     default_rpc_url,
     derive_default_realm,
     is_native_sol,
-    resolve_server_token_program,
+    resolve_mint,
+    resolve_server_asset,
     validate_network,
     validate_splits,
 )
@@ -129,7 +131,10 @@ class Config:
 
     recipient: str = ""
     currency: str = "USDC"
-    decimals: int = 6
+    # ``None`` derives the precision from the currency: 9 for SOL, the
+    # stablecoin table for known mints, the mint account for any other mint.
+    # An explicit value (``0`` included) must match what that resolves to.
+    decimals: int | None = None
     network: str = "mainnet"
     rpc_url: str = ""
     secret_key: str = ""
@@ -197,7 +202,6 @@ class Mpp:
             )
         self._realm = config.realm if config.realm else derive_default_realm(self._recipient)
         self._currency = config.currency or "USDC"
-        self._decimals = config.decimals or 6
         from solana_pay_kit._paycore.solana import _canonical_network as _canonical_net
 
         # Audit #37: reject any network outside {mainnet, devnet, localnet} at
@@ -209,16 +213,22 @@ class Mpp:
             raise PaymentError(str(exc), code="invalid-config") from exc
         self._network = _canonical_net(config.network or "mainnet")
         self._rpc_url = config.rpc_url or default_rpc_url(self._network)
-        # Audit #28: resolve the token program ONCE at boot. Known stablecoins
-        # resolve from the static table (Token vs Token-2022 correctly); an
-        # arbitrary mint address has its on-chain owner fetched and validated;
-        # a currency that is neither a known symbol nor a valid pubkey is
-        # rejected. The result is emitted on every SPL challenge instead of a
-        # silent legacy-Token fallback for arbitrary mints.
+        # Audit #28 / RULINGS C2: resolve the token program and decimals ONCE at
+        # boot. Known stablecoins resolve from the static table (Token vs
+        # Token-2022 correctly); an arbitrary mint address has its on-chain
+        # account fetched and validated; a currency that is neither a known
+        # symbol nor a valid pubkey is rejected. No precision is assumed for an
+        # arbitrary mint, and an explicit ``decimals=0`` stays 0.
         try:
-            self._token_program: str | None = resolve_server_token_program(self._currency, self._network, self._rpc_url)
+            asset = resolve_server_asset(self._currency, self._network, self._rpc_url, config.decimals)
         except ValueError as exc:
             raise PaymentError(str(exc), code="invalid-config") from exc
+        self._token_program: str | None = asset.token_program
+        self._decimals: int = asset.decimals
+        # RULINGS C1: the wire ``currency`` is "sol" or a mint address. A symbol
+        # is accepted in configuration only and resolved here, before it can
+        # reach a challenge.
+        self._wire_currency = "sol" if is_native_sol(self._currency) else resolve_mint(self._currency, self._network)
         self._html = config.html
         self._accept_push_mode = config.accept_push_mode
         self._fee_payer_signer = config.fee_payer_signer
@@ -337,7 +347,7 @@ class Mpp:
 
         request_obj: dict[str, Any] = {
             "amount": base_units,
-            "currency": self._currency,
+            "currency": self._wire_currency,
             "recipient": self._recipient,
         }
         if options.description:
@@ -376,6 +386,11 @@ class Mpp:
         succeed even if its other fields line up.
         """
         cred_request, _details, payload = self._verify_challenge_and_decode(credential)
+        # Callers build `expected` from route configuration, which may name
+        # the currency by symbol ("USDC") or as "SOL". The challenge carries
+        # the wire form ("sol" or the mint), so compare and settle against
+        # the same resolution the server used when it issued the challenge.
+        expected = self._to_wire_request(expected)
 
         if cred_request.amount != expected.amount:
             raise PaymentError(
@@ -398,6 +413,11 @@ class Mpp:
             expected_details = MethodDetails.from_dict(expected.method_details)
 
         return await self._verify_payload(credential, expected, expected_details, payload)
+
+    def _to_wire_request(self, request: ChargeRequest) -> ChargeRequest:
+        """Return ``request`` with its currency in wire form ("sol" or a mint)."""
+        wire = "sol" if is_native_sol(request.currency) else resolve_mint(request.currency, self._network)
+        return request if wire == request.currency else dataclasses.replace(request, currency=wire)
 
     def _verify_challenge_and_decode(
         self, credential: PaymentCredential
@@ -466,9 +486,10 @@ class Mpp:
                 f"(expected '{self._realm}')",
                 code="realm-mismatch",
             )
-        if request.currency != self._currency:
+        if request.currency != self._wire_currency:
             raise PaymentError(
-                f"credential currency '{request.currency}' does not match this server (expected '{self._currency}')",
+                f"credential currency '{request.currency}' does not match this server "
+                f"(expected '{self._wire_currency}')",
                 code="currency-mismatch",
             )
         if request.recipient != self._recipient:

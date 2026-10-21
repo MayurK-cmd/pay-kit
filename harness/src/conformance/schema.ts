@@ -29,9 +29,10 @@ export type VectorSplit = {
 };
 
 // The decoded charge offer/request a build/verify vector operates on.
-// Field omission is intentional and meaningful: a missing `decimals`
-// must default to 6, a missing `tokenProgram` must default by currency,
-// etc. Runners MUST NOT inject defaults the SDK would not.
+// Field omission is intentional and meaningful: a mint challenge without
+// `decimals` must be refused, and a missing `tokenProgram` must be resolved
+// from the mint account via the fixture RPC (RULINGS C2, C3). Runners pass
+// the request to the SDK verbatim and MUST NOT inject defaults.
 export type VectorChargeRequest = {
   amount: string;
   currency: string;
@@ -60,12 +61,13 @@ export type VectorChargeRequest = {
 };
 
 export type VectorRpcFixtures = {
-  // Pinned blockhash so the build path needs no live RPC.
+  // Chain blockhash served by getLatestBlockhash. Defaults to the
+  // challenge's methodDetails.recentBlockhash.
   recentBlockhash?: string;
-  // mint pubkey -> owning token program. Lets the build/verify path
-  // resolve a token program without an RPC getAccountInfo call when the
-  // vector omits methodDetails.tokenProgram.
-  mintOwners?: Record<string, string>;
+  // mint address -> account served by getAccountInfo / getMultipleAccounts
+  // (82-byte SPL mint layout). A mint absent here does not exist, so an SDK
+  // that must look it up (tokenProgram omitted, x402 decimals) has to reject.
+  mints?: Record<string, { owner: string; decimals: number }>;
 };
 
 // The decoded semantic shape of an x402 `exact` envelope. This is the
@@ -202,11 +204,19 @@ export type RejectCode =
   // id (missing, empty, or pattern-violating). The coinbase spec maps
   // this to HTTP 400; the conformance oracle pins it as a reject category.
   | "payment-identifier-required"
+  // charge / x402 client: the challenge itself violates the method spec
+  // (e.g. decimals missing for a mint, tokenProgram omitted and the mint
+  // lookup failed or returned an unexpected owner) and must be refused.
+  | "invalid-challenge"
   // session voucher verify: a non-zero expiry at/before now.
   | "voucher-expired"
   // session voucher verify: a non-zero expiry at/before now + settlement
   // window (the boundary is exclusive).
-  | "voucher-expires-before-settlement";
+  | "voucher-expires-before-settlement"
+  // x402-exact v2: the credential's `accepted` matches none of the route's
+  // payment requirements (amount, payTo, asset or network differ). Covers
+  // both targeted field checks and a structural match against the offers.
+  | "accepted-mismatch";
 
 export type VectorInput = {
   // build-transaction / verify-transaction
@@ -218,6 +228,11 @@ export type VectorInput = {
   // Ed25519 secret key (64-byte array) for the transfer authority / signer.
   signerSecretKey?: number[];
   rpcFixtures?: VectorRpcFixtures;
+  // Injected by the driver, never authored: URL of a fixture JSON-RPC
+  // server built from rpcFixtures (rust/crates/conformance/src/fixture_rpc.rs). Runners
+  // MUST pass it to their SDK as the RPC endpoint and MUST NOT resolve
+  // chain state (token programs, decimals) themselves.
+  rpcUrl?: string;
   // canonical-bytes: the JSON value to canonicalize, OR the raw input for
   // a base64url / fixed-width byte vector.
   value?: unknown;
@@ -306,10 +321,8 @@ export type VectorInput = {
   // build-transaction (x402): which wire version to build (1 = legacy
   // X-PAYMENT, 2 = canonical PAYMENT-SIGNATURE). Required for x402 builds.
   x402Version?: 1 | 2;
-  // build-transaction (x402): a pinned base64 transaction proof so the
-  // build path is deterministic and RPC-free. The conformance oracle is
-  // the envelope shape, not the signed-transaction bytes; a real SDK
-  // signs a Solana tx here, verified by the harness matrix.
+  // DEPRECATED, absent from every vector: builds must sign a real
+  // transaction. Kept only until the TypeScript runner stops reading it.
   x402PinnedTransaction?: string;
   // verify-transaction (x402): the server's configured route. The server
   // verifies the submitted `paymentHeader` against this network/recipient/
@@ -319,8 +332,13 @@ export type VectorInput = {
   x402ServerCurrency?: string;
   x402ServerAmount?: string;
   // verify-transaction (x402): the base64 PAYMENT-SIGNATURE / X-PAYMENT
-  // header value the server must verify. Pinned so verify needs no build.
+  // header value the server must verify. Its payload carries a real,
+  // partially signed transaction the SDK verifier must inspect (RULINGS S3).
   x402PaymentHeader?: string;
+  // verify-transaction (x402): the server's fee payer, which the
+  // transaction names as message fee payer with an empty signature slot.
+  x402ServerFeePayer?: string;
+  x402ServerFeePayerSecretKey?: number[];
 
   // ── x402-exact extensions inputs (rust PaymentExtensions) ────────────
   // build-transaction (x402): the `extensions` object the server
@@ -339,6 +357,20 @@ export type VectorInput = {
   // echoed `extensions["payment-identifier"].info.id` is missing or does
   // not match ^[A-Za-z0-9_-]{16,128}$.
   x402ServerRequiresPaymentIdentifier?: boolean;
+  // verify-transaction (x402): the route's `extra.memo`. When present the
+  // verifier MUST require exactly one Memo instruction carrying it
+  // (scheme_exact_svm §3.1), and the route's accepted object carries it.
+  x402ServerMemo?: string;
+};
+
+// Where a vector's rule is written down. `doc` is `<repo>/<path>` inside a
+// pinned spec repository: `mpp-specs/...` (external/mpp-specs) or `x402/...`
+// (typescript/external/x402). `quote` appears verbatim (whitespace and
+// markdown emphasis normalised) in that file; `pkc req-lint` enforces it.
+export type VectorSpecRef = {
+  doc: string;
+  section: string;
+  quote: string;
 };
 
 export type ConformanceVector = {
@@ -346,9 +378,23 @@ export type ConformanceVector = {
   intent: "charge" | "x402-exact" | "session";
   mode: VectorMode;
   description?: string;
+  // Required traceability (filled by `pkc fill`; never hand-edited).
+  spec: VectorSpecRef;
+  // Requirement ids from harness/requirements/{mpp,x402}.toml.
+  requirements?: string[];
+  bugType?: "replay" | "auth-bypass" | "settlement" | "wire" | "defaults" | "malleability" | "precedence";
+  tier?: "offline" | "interop" | "onchain";
+  role?: "client" | "server" | "both";
+  // generated: expected value computed by the Rust kit. authored: taken
+  // from the spec text.
+  provenance?: "generated" | "authored";
   input: VectorInput;
   expect: VectorExpect;
 };
+
+// The fields a runner receives on stdin: the vector ABI without the
+// traceability metadata, so runners keep working unchanged.
+export const RUNNER_VECTOR_KEYS = ["id", "intent", "mode", "description", "input", "expect"] as const;
 
 // `RunnerOutcome` (declared near the top of this file) is the per-runner
 // outcome including the `unsupported-mode` skip signal.
@@ -374,4 +420,11 @@ export type RunnerResult = {
   // Present on reject: the normalized category the runner mapped its native
   // error onto. Asserted against VectorExpect.rejectCode when both are set.
   rejectCode?: RejectCode;
+  // Present on an accepted charge build: the built base64 wire transaction.
+  // `pkc run` runs the Rust kit's verifier on it and compares its
+  // instruction multiset with the kit's own build of the same case.
+  transaction?: string;
+  // Present on an accepted x402 build: the built base64 payment header,
+  // judged the same way.
+  x402PaymentHeader?: string;
 };

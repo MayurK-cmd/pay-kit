@@ -13,7 +13,8 @@ use solana_pay_kit::solana_keychain::{memory::MemorySigner, SolanaSigner};
 use solana_pay_kit::x402::{
     protocol::schemes::exact::{PaymentRequiredEnvelope, PaymentRequirements},
     server::{
-        exact::PaymentOption, Config, CurrencyConfig, ExactOptions, VerifiedExactPayment, X402,
+        exact::PaymentOption, Config, CurrencyConfig, ExactOptions, PaymentIdentifierPolicy,
+        VerifiedExactPayment, X402,
     },
     PAYMENT_REQUIRED_HEADER, PAYMENT_RESPONSE_HEADER, PAYMENT_SIGNATURE_HEADER, X402_VERSION_V2,
 };
@@ -28,12 +29,21 @@ const TOKEN_DECIMALS: u8 = 6;
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 #[derive(Clone)]
+struct Route {
+    path: String,
+    price: String,
+}
+
+#[derive(Clone)]
 struct HarnessState {
     x402: X402,
     rpc_url: String,
     fee_payer: Arc<MemorySigner>,
-    price: String,
-    resource_path: String,
+    /// Paid routes this server mounts: the scenario route first, then the
+    /// optional replay-source route (`MPP_HARNESS_REPLAY_SOURCE_PATH`), each
+    /// with its own price, so a credential issued for one is verified
+    /// against the other's requirements.
+    routes: Vec<Route>,
     settlement_header: String,
     /// Additional currencies (beyond `Config.currency`) this server offers
     /// for the same route. Populated from `X402_HARNESS_EXTRA_OFFERED_MINTS`
@@ -87,6 +97,22 @@ fn read_state() -> Result<HarnessState, Box<dyn std::error::Error + Send + Sync>
     let price = normalize_price(
         &env::var("X402_HARNESS_PRICE").unwrap_or_else(|_| DEFAULT_PRICE.to_string()),
     )?;
+    // The harness picks a path per scenario (e.g. /protected/expensive); the
+    // route match and the advertised resource must both use it.
+    let resource_path = env::var("X402_HARNESS_RESOURCE_PATH")
+        .unwrap_or_else(|_| DEFAULT_RESOURCE_PATH.to_string());
+    let mut routes = vec![Route {
+        path: resource_path.clone(),
+        price,
+    }];
+    if let Ok(path) = env::var("MPP_HARNESS_REPLAY_SOURCE_PATH") {
+        if !path.trim().is_empty() {
+            routes.push(Route {
+                path,
+                price: normalize_price(&read_required_env("MPP_HARNESS_REPLAY_SOURCE_PRICE")?)?,
+            });
+        }
+    }
 
     let extra_offered_mints: Vec<String> = env::var("X402_HARNESS_EXTRA_OFFERED_MINTS")
         .ok()
@@ -119,16 +145,17 @@ fn read_state() -> Result<HarnessState, Box<dyn std::error::Error + Send + Sync>
             currencies,
             network,
             rpc_url: Some(rpc_url.clone()),
-            resource: DEFAULT_RESOURCE_PATH.to_string(),
+            resource: resource_path.clone(),
             description: Some("Surfpool-backed protected content".to_string()),
             max_age: Some(60),
             fee_payer_key: Some(fee_payer.pubkey().to_string()),
+            payment_identifier: PaymentIdentifierPolicy::NotAdvertised,
         })?,
         rpc_url,
         fee_payer,
-        price,
-        resource_path: DEFAULT_RESOURCE_PATH.to_string(),
-        settlement_header: DEFAULT_SETTLEMENT_HEADER.to_string(),
+        routes,
+        settlement_header: env::var("X402_HARNESS_SETTLEMENT_HEADER")
+            .unwrap_or_else(|_| DEFAULT_SETTLEMENT_HEADER.to_string()),
         extra_offered_mints,
     })
 }
@@ -136,14 +163,14 @@ fn read_state() -> Result<HarnessState, Box<dyn std::error::Error + Send + Sync>
 /// Build the full list of payment options this server advertises. The
 /// primary currency comes from `Config.currency`; any additional mints in
 /// `X402_HARNESS_EXTRA_OFFERED_MINTS` are appended.
-fn payment_options(state: &HarnessState) -> Vec<PaymentOption<'static>> {
+fn payment_options(state: &HarnessState, route: &Route) -> Vec<PaymentOption<'static>> {
     // SAFETY: the strings live as long as the leaked allocation does. We
     // leak intentionally because adapter binaries are short-lived and the
     // allocations need 'static lifetimes for `PaymentOption<'static>`.
     let primary_currency: &'static str =
         Box::leak(state.x402.currency().to_string().into_boxed_str());
-    let price: &'static str = Box::leak(state.price.clone().into_boxed_str());
-    let resource_path: &'static str = Box::leak(state.resource_path.clone().into_boxed_str());
+    let price: &'static str = Box::leak(route.price.clone().into_boxed_str());
+    let resource_path: &'static str = Box::leak(route.path.clone().into_boxed_str());
 
     let extras: Vec<PaymentOption<'static>> = state
         .extra_offered_mints
@@ -214,8 +241,13 @@ fn handle_connection(
 
     match (method, path) {
         ("GET", HEALTH_PATH) => write_json_response(&mut stream, 200, &[], &json!({ "ok": true }))?,
-        ("GET", path) if path == state.resource_path => {
-            let offered = payment_options(state);
+        ("GET", path) if state.routes.iter().any(|route| route.path == path) => {
+            let route = state
+                .routes
+                .iter()
+                .find(|route| route.path == path)
+                .expect("route matched above");
+            let offered = payment_options(state, route);
             let requirements_list = build_offered_requirements(state, &offered)?;
             let primary_network = requirements_list[0].network.clone();
             if let Some(payment_header) =
@@ -247,20 +279,25 @@ fn handle_connection(
                         )?;
                     }
                     Err(error) => {
-                        let (_, header_value) = payment_required_header_for(&requirements_list)?;
+                        let (_, header_value) =
+                            payment_required_header_for(state, &requirements_list)?;
+                        let typed = error.downcast_ref::<solana_pay_kit::x402::Error>();
+                        // A missing required payment-identifier is a 400.
+                        let status = typed.map_or(402, solana_pay_kit::x402::Error::http_status);
                         write_json_response(
                             &mut stream,
-                            402,
+                            status,
                             &[(PAYMENT_REQUIRED_HEADER, header_value.as_str())],
                             &json!({
                                 "error": "payment_invalid",
+                                "code": typed.map_or("payment_invalid", canonical_code),
                                 "message": error.to_string(),
                             }),
                         )?;
                     }
                 }
             } else {
-                let (_, header_value) = payment_required_header_for(&requirements_list)?;
+                let (_, header_value) = payment_required_header_for(state, &requirements_list)?;
                 write_json_response(
                     &mut stream,
                     402,
@@ -295,6 +332,7 @@ fn build_offered_requirements(
 }
 
 fn payment_required_header_for(
+    state: &HarnessState,
     requirements: &[PaymentRequirements],
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
     let envelope = PaymentRequiredEnvelope {
@@ -302,7 +340,7 @@ fn payment_required_header_for(
         resource: requirements.first().and_then(|r| r.resource_info()),
         accepts: requirements.to_vec(),
         error: None,
-        extensions: None,
+        extensions: state.x402.advertised_extensions(),
     };
     let json = serde_json::to_string(&envelope)?;
     Ok((
@@ -356,6 +394,7 @@ fn write_json_response(
     let body = serde_json::to_vec(body)?;
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
         402 => "Payment Required",
         404 => "Not Found",
         _ => "Internal Server Error",
@@ -372,6 +411,20 @@ fn write_json_response(
     stream.write_all(&body)?;
     stream.flush()?;
     Ok(())
+}
+
+/// Canonical L6 error code for a typed x402 rejection (harness/src/canonical-codes.ts).
+fn canonical_code(error: &solana_pay_kit::x402::Error) -> &'static str {
+    use solana_pay_kit::x402::Error;
+    match error {
+        Error::AcceptedMismatch
+        | Error::AmountMismatch { .. }
+        | Error::RecipientMismatch { .. }
+        | Error::MintMismatch { .. } => "charge_request_mismatch",
+        Error::WrongNetwork { .. } => "wrong_network",
+        Error::SignatureConsumed => "signature_consumed",
+        _ => "payment_invalid",
+    }
 }
 
 fn read_required_env(name: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {

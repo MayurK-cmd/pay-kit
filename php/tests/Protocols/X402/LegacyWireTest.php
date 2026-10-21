@@ -196,6 +196,44 @@ final class LegacyWireTest extends TestCase
         self::assertSame('solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1', $network);
     }
 
+    // ── matchCanonicalCredential: accepted binds to the offer ──────────────
+
+    /** @return array<string, mixed> */
+    private function offer(): array
+    {
+        return [
+            'scheme'            => 'exact',
+            'network'           => 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+            'asset'             => 'Mint1111111111111111111111111111111111111111',
+            'amount'            => '1000',
+            'payTo'             => 'PayTo111111111111111111111111111111111111111',
+            'maxTimeoutSeconds' => 60,
+            'extra'             => ['feePayer' => 'FeePayer11111111111111111111111111111111111'],
+        ];
+    }
+
+    public function testCanonicalCredentialMatchesHonestAcceptedEcho(): void
+    {
+        $adapter = $this->makeAdapter();
+        $offer = $this->offer();
+        $this->invoke($adapter, 'matchCanonicalCredential', ['accepted' => $offer], $offer);
+        self::assertTrue(true);
+    }
+
+    public function testCanonicalCredentialRejectsAcceptedAmountLie(): void
+    {
+        // x402-specification-v2.md §5.2.2: `accepted` is the chosen
+        // requirement, amount included. A cheaper claimed amount is an
+        // accepted mismatch, not a later transfer-amount failure.
+        $adapter = $this->makeAdapter();
+        $offer = $this->offer();
+        $accepted = $offer;
+        $accepted['amount'] = '1';
+        $this->expectException(InvalidProofException::class);
+        $this->expectExceptionMessageMatches('/charge_request_mismatch/');
+        $this->invoke($adapter, 'matchCanonicalCredential', ['accepted' => $accepted], $offer);
+    }
+
     // ── decodeCredential: base64(JSON) decode guards ───────────────────────
 
     public function testDecodeCredentialRejectsBadBase64(): void
@@ -299,6 +337,55 @@ final class LegacyWireTest extends TestCase
         $this->expectException(InvalidProofException::class);
         $this->expectExceptionMessageMatches('/unsupported_x402_version/');
         $adapter->verifyAndSettle($this->makeGate(), $req);
+    }
+
+    /**
+     * RULINGS S1: extra.tokenProgram / extra.decimals are non-spec hints, so
+     * an `accepted` echo that omits them still binds to the offer.
+     */
+    public function testCanonicalMatchIgnoresNonSpecExtraHints(): void
+    {
+        $adapter = $this->makeAdapter(Network::SolanaDevnet);
+        $offer = $adapter->acceptsEntry($this->makeGate(), $this->request());
+        $accepted = $offer;
+        unset($accepted['extra']['tokenProgram'], $accepted['extra']['decimals']);
+
+        $this->invoke($adapter, 'matchCanonicalCredential', ['x402Version' => 2, 'accepted' => $accepted], $offer);
+        $this->addToAssertionCount(1);
+    }
+
+    /** Negative control: a spec field of `extra` (feePayer) still binds. */
+    public function testCanonicalMatchStillBindsFeePayer(): void
+    {
+        $adapter = $this->makeAdapter(Network::SolanaDevnet);
+        $offer = $adapter->acceptsEntry($this->makeGate(), $this->request());
+        $accepted = $offer;
+        $accepted['extra']['feePayer'] = Signer::generate()->pubkey();
+
+        $this->expectException(InvalidProofException::class);
+        $this->expectExceptionMessageMatches('/extra\.feePayer/');
+        $this->invoke($adapter, 'matchCanonicalCredential', ['x402Version' => 2, 'accepted' => $accepted], $offer);
+    }
+
+    /**
+     * Pre-broadcast verification inspects the transaction: a route-matching
+     * envelope whose transaction is not a payment is rejected, never accepted
+     * on the envelope alone (RULINGS S3).
+     */
+    public function testVerifyPaymentHeaderRunsTheTransactionVerifier(): void
+    {
+        $adapter = $this->makeAdapter(Network::SolanaDevnet);
+        $offer = $adapter->acceptsEntry($this->makeGate(), $this->request());
+        unset($offer['extra']['memo']);
+        $header = $this->legacyHeader([
+            'x402Version' => 2,
+            'accepted'    => $offer,
+            'payload'     => ['transaction' => 'AA=='],
+        ]);
+
+        $this->expectException(InvalidProofException::class);
+        $this->expectExceptionMessageMatches('/invalid_exact_svm_payload/');
+        $adapter->verifyPaymentHeader($this->makeGate(), $header, null);
     }
 
     public function testVerifyAndSettleCanonicalHeaderTakesPrecedenceOverLegacy(): void

@@ -12,9 +12,6 @@ let X402ComputeUnitLimit: UInt32 = 20_000
 /// ComputeBudget SetComputeUnitPrice micro-lamports.
 let X402ComputeUnitPrice: UInt64 = 1
 
-/// Default SPL decimals when the offer omits `extra.decimals`.
-let X402DefaultDecimals: UInt8 = 6
-
 // MARK: - Challenge parsing
 
 /// A selected x402 offer together with the protocol version the server's
@@ -112,10 +109,12 @@ let X402MemoMaxBytes: Int = 256
 /// Build the standard-base64 `Payment-Signature` header value for an x402
 /// exact offer.
 ///
-/// Transaction shape (v0, fee-payer from `extra.feePayer` or client):
+/// Transaction shape (v0, fee payer `extra.feePayer`, required):
 ///   1. `ComputeBudgetSetUnitLimit(20_000)`
 ///   2. `ComputeBudgetSetUnitPrice(1)`
-///   3. `splTransferChecked` (SPL) **or** `systemTransfer` (native SOL)
+///   3. `splTransferChecked` (SPL) **or** `systemTransfer` (native SOL).
+///      Token program and decimals come from the mint account read
+///      through `rpc`; a non-spec `decimals` hint must agree with it.
 ///   4. Memo instruction: `extra.memo` when present, else a random 16-byte
 ///      hex-encoded nonce (always appended to guarantee transaction
 ///      uniqueness). Mirrors the Rust `build_payment_transaction` which
@@ -287,14 +286,13 @@ private func _buildPaymentPayload(
     let signerPubkey = try Pubkey(bytes: signer.publicKey)
     let recipientPubkey = try Pubkey(base58: payToStr)
 
-    // Managed fee payer: prefer the top-level `feePayerKey`, then the nested
-    // `extra.feePayer` alias, gated by the `feePayer` toggle (rust types.rs
-    // normalization). When absent, the local signer pays.
-    let feePayerPubkey: Pubkey
-    if let fpStr = offer.effectiveFeePayerKey {
-        feePayerPubkey = try Pubkey(base58: fpStr)
-    } else {
-        feePayerPubkey = signerPubkey
+    // scheme_exact_svm.md requires `extra.feePayer` (RULINGS S1). The
+    // facilitator pays fees and its signature slot stays empty; an offer
+    // without one is refused, never signed with the client as fee payer.
+    guard let feePayerPubkey = _requiredFeePayer(offer) else {
+        throw PayKitError.invalidTransaction(
+            "x402 exact offer is missing a valid extra.feePayer (scheme_exact_svm.md)"
+        )
     }
 
     var instructions: [SolanaInstruction] = []
@@ -309,20 +307,26 @@ private func _buildPaymentPayload(
     let mintAddress = Mints.resolveMint(currency: assetStr, cluster: clusterLabel)
 
     if let mintStr = mintAddress {
-        // Default the token program from the currency (Token vs Token-2022)
-        // when the offer omits `extra.tokenProgram`, so Token-2022 mints
-        // (USDG / PYUSD / CASH) derive the correct ATA. Mirrors rust
-        // `default_token_program_for_currency`.
-        let tokenProgramStr = offer.effectiveTokenProgram
-            ?? Mints.defaultTokenProgram(currency: assetStr, cluster: clusterLabel)
-        let tokenProgram = try Pubkey(base58: tokenProgramStr)
         let mint = try Pubkey(base58: mintStr)
-        let decimals: UInt8
-        if let d = offer.effectiveDecimals, d >= 0, d <= 255 {
-            decimals = UInt8(d)
-        } else {
-            decimals = X402DefaultDecimals
+        // The token program and decimals come from the mint account
+        // (scheme_exact_svm.md keeps decimals out of `extra`; the ATA
+        // derivation depends on the owning program). No table, no default:
+        // a mint that cannot be read is refused.
+        let account = try await rpc.getMintAccount(mintBase58: mintStr)
+        if let stated = offer.effectiveTokenProgram, stated != account.tokenProgram.base58 {
+            throw PayKitError.invalidTransaction(
+                "x402 offer tokenProgram \(stated) does not own mint \(mintStr) (owner \(account.tokenProgram.base58))"
+            )
         }
+        // A server-sent decimals value is a non-spec hint the client MAY
+        // use; one that disagrees with the mint is a hostile or broken offer.
+        if let hinted = offer.effectiveDecimals, hinted != Int(account.decimals) {
+            throw PayKitError.invalidTransaction(
+                "x402 offer decimals \(hinted) do not match mint \(mintStr) decimals \(account.decimals)"
+            )
+        }
+        let tokenProgram = account.tokenProgram
+        let decimals = account.decimals
         let sourceAta = try AssociatedTokenAccount.address(
             owner: signerPubkey, mint: mint, tokenProgram: tokenProgram
         )
@@ -493,10 +497,21 @@ private func _selectRequirement(
     return candidates.min(by: { _effectiveAmountOf($0) < _effectiveAmountOf($1) })
 }
 
+/// The facilitator fee payer an exact SVM offer must carry in
+/// `extra.feePayer` (scheme_exact_svm.md), or `nil` when absent or not a
+/// valid pubkey.
+private func _requiredFeePayer(_ offer: X402AcceptsEntry) -> Pubkey? {
+    guard let key = offer.extraString("feePayer") else { return nil }
+    return try? Pubkey(base58: key)
+}
+
 private func _isSolanaExact(_ offer: X402AcceptsEntry) -> Bool {
     // Require an explicit `scheme == "exact"` (python parity): offers
     // without a scheme, or with a different scheme, are not eligible.
     guard offer.scheme == "exact" else { return false }
+    // An offer without the required `extra.feePayer` (RULINGS S1) is not
+    // payable; skip it so a conforming sibling offer can be chosen.
+    guard _requiredFeePayer(offer) != nil else { return false }
     // Accept both CAIP-2 ids (v2 challenges) and legacy plain SVM slugs
     // (`solana` / `solana-devnet` / `solana-testnet`, carried by legacy 402
     // bodies). Mirrors the rust selection filter, which keeps any offer

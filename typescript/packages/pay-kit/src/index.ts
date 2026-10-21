@@ -10,6 +10,15 @@
  */
 
 export type { ProtocolAdapter } from './adapter.js';
+export {
+    assertX402AcceptedMatchesRoute,
+    assertX402FeePayerIsolated,
+    verifyX402ExactCredential,
+    X402_ACCEPTED_MISMATCH,
+    X402_FEE_PAYER_IN_INSTRUCTION_ACCOUNTS,
+    type X402ExactCredential,
+    type X402ExactRouteRequirements,
+} from './adapters/x402-exact-verify.js';
 export { Charge } from './adapters/x402-upto.js';
 export type { AcceptsEntry, Challenge } from './challenge.js';
 export {
@@ -30,6 +39,7 @@ export {
     InvalidProofError,
     MixedCurrenciesError,
     PayKitError,
+    PaymentIdentifierError,
     PaymentRequiredError,
     ProtocolIncompatibleError,
     ProtocolNotSupportedError,
@@ -54,6 +64,13 @@ export {
     type ServiceInfo,
 } from './openapi.js';
 export type { Payment } from './payment.js';
+export {
+    PAYMENT_IDENTIFIER,
+    PaymentIdentifier,
+    paymentIdentifierDeclaration,
+    type PaymentIdentifierPolicy,
+    readPaymentIdentifier,
+} from './payment-identifier.js';
 export {
     createPayKit,
     type CreatePayKitOptions,

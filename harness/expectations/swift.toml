@@ -1,0 +1,145 @@
+language = "swift"
+
+# Suites and vector intents this SDK claims. Unclaimed ones are shown
+# as "unclaimed" in the coverage table; they are never silently skipped.
+[capabilities]
+vector = ["charge", "x402-exact", "session"]
+protocol = false
+flow = false
+# Interop roles (pkc run --tier interop), <protocol>:<scheme>:<role>; cases are interop/<scenario>/<client>/<server>.
+interop = ["mpp:charge:client", "x402:exact:client", "x402:upto:client"]
+# Whether the testee drives the SDK at the clock a vector pins; no session voucher verifier, so no clock-pinned case runs (all listed unsupported).
+# Cross-checked against the testee `capabilities` op.
+honours_clock = false
+
+[[unsupported]]
+reason = "swift session wire types (SessionTypes.swift) model the superseded draft; the SDK has no parser for the final session wire contract"
+ids = [
+  "vector/session-wire-action-close-frozen",
+  "vector/session-wire-action-open-draft-slot-echo-reject",
+  "vector/session-wire-action-open-frozen",
+  "vector/session-wire-action-unknown-tag-reject",
+  "vector/session-wire-action-voucher-frozen",
+  "vector/session-wire-action-voucher-legacy-inner-data-reject",
+  "vector/session-wire-request-new-channel-frozen",
+  "vector/session-wire-request-resume-frozen",
+  "vector/session-wire-request-superseded-draft-reject",
+]
+
+[[unsupported]]
+reason = "swift is a client-only SDK and does not implement verify-transaction"
+ids = [
+  "vector/charge-compute-price-over-cap-reject",
+  "vector/charge-feepayer-as-authority-reject",
+  "vector/charge-split-duplicate-memo-accept",
+  "vector/charge-split-duplicate-memo-reuse-reject",
+  "vector/charge-split-duplicate-recipient-sol-accept",
+  "vector/charge-split-duplicate-recipient-sol-reuse-reject",
+  "vector/charge-split-duplicate-recipient-spl-accept",
+  "vector/charge-split-duplicate-recipient-spl-reuse-reject",
+  "vector/charge-verify-wrong-amount-reject",
+  "vector/charge-verify-wrong-mint-reject",
+  "vector/charge-verify-wrong-recipient-reject",
+  "vector/charge-split-ata-memo-envelope-accept",
+  "vector/charge-transferchecked-decimals-match-accept",
+  "vector/charge-transferchecked-decimals-mismatch-reject",
+  "vector/session-voucher-expired-at-now",
+  "vector/session-voucher-never-expires-with-window",
+  "vector/session-voucher-window-at-boundary",
+  "vector/session-voucher-window-one-above",
+  "vector/session-voucher-window-one-below",
+  "vector/charge-verify-ata-for-arbitrary-owner-reject",
+  "vector/charge-verify-ata-for-top-level-recipient-reject",
+  "vector/charge-verify-ata-noncanonical-address-reject",
+  "vector/charge-verify-ata-not-idempotent-reject",
+  "vector/charge-verify-ata-payer-not-fee-payer-reject",
+  "vector/charge-verify-ata-required-missing-reject",
+  "vector/charge-verify-ata-wrong-mint-reject",
+  "vector/charge-verify-ata-wrong-token-program-reject",
+  "vector/charge-verify-compute-budget-heap-frame-reject",
+  "vector/charge-verify-external-id-over-memo-limit-reject",
+  "vector/charge-verify-fee-payer-not-server-key-reject",
+  "vector/charge-verify-sol-ata-creation-required-reject",
+  "vector/charge-verify-sol-split-transfer-missing-reject",
+  "vector/charge-verify-split-transfer-missing-reject",
+  "vector/charge-verify-splits-consume-amount-reject",
+  "vector/charge-verify-splits-exceed-amount-reject",
+  "vector/charge-verify-sponsored-ata-required-accept",
+  "vector/charge-verify-sponsored-ata-top-level-reject",
+  "vector/charge-verify-sponsored-ata-unmarked-split-reject",
+  "vector/charge-verify-sponsored-fee-payer-drain-reject",
+  "vector/charge-verify-sponsored-sol-fee-payer-source-reject",
+  "vector/charge-verify-too-many-splits-reject",
+  "vector/charge-verify-two-splits-accept",
+  "vector/charge-verify-unknown-program-reject",
+]
+
+[[unsupported]]
+reason = "swift is a client-only SDK and does not implement x402 verify-transaction"
+ids = [
+  "vector/x402-exact-unknown-version-reject",
+  "vector/x402-exact-v1-verify-accept-devnet",
+  "vector/x402-exact-v1-verify-accept-mainnet",
+  "vector/x402-exact-v1-verify-reject-unknown-version",
+  "vector/x402-exact-v1-verify-reject-wrong-network",
+  "vector/x402-exact-v2-verify-accept",
+  "vector/x402-ext-server-accepts-valid-id",
+  "vector/x402-ext-server-rejects-required-missing-id",
+  "vector/x402-exact-v2-verify-wrong-network-reject",
+  "vector/x402-exact-verify-accepted-amount-lie-reject",
+  "vector/x402-exact-verify-accepted-asset-lie-reject",
+  "vector/x402-exact-verify-accepted-payto-lie-reject",
+  "vector/x402-exact-verify-fee-payer-authority-reject",
+  "vector/x402-exact-verify-fee-payer-in-accounts-reject",
+  "vector/x402-exact-verify-memo-match-accept",
+  "vector/x402-exact-verify-memo-mismatch-reject",
+  "vector/x402-exact-verify-overpayment-accept",
+  "vector/x402-exact-verify-two-transfers-reject",
+  "vector/x402-exact-verify-underpayment-reject",
+  "vector/x402-exact-verify-zero-transfers-reject",
+  "vector/x402-exact-verify-compute-heap-frame-reject",
+  "vector/x402-exact-verify-duplicate-memo-reject",
+  "vector/x402-exact-verify-extra-compute-budget-reject",
+  "vector/x402-exact-verify-extra-required-signer-reject",
+  "vector/x402-exact-verify-fee-payer-sol-drain-reject",
+  "vector/x402-exact-verify-lighthouse-accept",
+  "vector/x402-exact-verify-unknown-program-reject",
+]
+
+[[known_failing]]
+id = "vector/charge-build-sol-token-program-reject"
+reason = "the client builds a SOL charge whose challenge carries tokenProgram (swift/Sources/SolanaPayKit/Protocols/Mpp/Client/Charge.swift:319)"
+tracking = "FINDINGS.md#charge-client-sol-token-program-ignored"
+
+[[known_failing]]
+id = "vector/charge-build-unknown-network-reject"
+reason = "the client builds for network \"testnet\"; the network guard is opt-in (swift/Sources/SolanaPayKit/Protocols/Mpp/Client/Charge.swift:164)"
+tracking = "FINDINGS.md#charge-client-unknown-network"
+
+[[known_failing]]
+ids = [
+  "interop/charge-client-wrong-network/swift/rust",
+]
+reason = "the client submits a credential for a challenge naming another cluster (draft-solana-charge-00: \"Clients MUST reject challenges whose network does not match their configured cluster\")"
+tracking = "FINDINGS.md#charge-client-network-not-checked"
+
+[[known_failing]]
+ids = [
+  "interop/charge-client-over-asking-price/swift/rust",
+]
+reason = "the client pays a challenge whose amount was multiplied by 10000 after the server bound it; nothing checks the amount against what it was asked to pay (core: \"Clients MUST verify before authorizing payment\")"
+tracking = "FINDINGS.md#charge-client-request-not-verified"
+
+[[known_failing]]
+ids = [
+  "interop/charge-client-mis-signed-challenge/swift/rust",
+]
+reason = "the client pays a challenge whose recipient was replaced after the server bound its id (core: \"Clients MUST verify before authorizing payment ... Recipient/address is expected\")"
+tracking = "FINDINGS.md#charge-client-request-not-verified"
+
+[[known_failing]]
+ids = [
+  "interop/x402-exact-client-wrong-network/swift/rust",
+]
+reason = "the x402 client pays a requirement for solana mainnet while configured for the devnet CAIP-2 network"
+tracking = "FINDINGS.md#x402-client-network-not-checked"

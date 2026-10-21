@@ -1,0 +1,109 @@
+language = "typescript"
+
+# Suites and vector intents this SDK claims. Unclaimed ones are shown
+# as "unclaimed" in the coverage table; they are never silently skipped.
+[capabilities]
+vector = ["charge", "x402-exact", "session"]
+protocol = true
+flow = true
+# Offline cross-verification: this SDK verifies every other SDK's saved builds
+# (`pkc run --cross --require`); cells are cross/<case>/<client>/<server>.
+cross = true
+# Interop roles (pkc run --tier interop), <protocol>:<scheme>:<role>; cases are interop/<scenario>/<client>/<server>.
+interop = ["mpp:charge:client", "mpp:charge:server", "x402:exact:client", "x402:exact:server"]
+# Whether the testee drives the SDK at the clock a vector pins; the runner drives the session voucher verifier at sessionVoucherVerify.nowSeconds.
+# Cross-checked against the testee `capabilities` op.
+honours_clock = true
+
+[[unsupported]]
+reason = "flow driver port does not implement the upstream `http.payment_request` client capability"
+ids = [
+  "flow/cross_origin_redirect_before_402_rejected",
+  "flow/plain_payment_request",
+  "flow/same_origin_payment_request",
+  "flow/same_origin_post_payment_request",
+]
+
+[[unsupported]]
+reason = "@solana/pay-kit speaks x402 v2 only: its client answers only the PAYMENT-REQUIRED header and its server registers only the v2 exact facilitator"
+ids = [
+  "vector/x402-exact-v1-build-devnet",
+  "vector/x402-exact-v1-build-mainnet-network-name",
+  "vector/x402-exact-v1-verify-accept-devnet",
+  "vector/x402-exact-v1-verify-accept-mainnet",
+  "vector/x402-exact-v1-verify-reject-wrong-network",
+]
+
+[[unsupported]]
+reason = "@solana/pay-kit speaks x402 v2 only, so its verifier cannot check other SDKs' v1 X-PAYMENT builds"
+pattern = "cross/x402-exact-v1-build-*/*/typescript"
+
+[[unsupported]]
+reason = "@solana/pay-kit generates the payment-identifier id itself and has no option to supply the caller-chosen id these vectors pin"
+ids = [
+  "vector/x402-ext-echo-payment-identifier-pinned-id",
+  "vector/x402-ext-preserve-unknown-verbatim",
+]
+
+[[known_failing]]
+id = "vector/x402-exact-verify-overpayment-accept"
+reason = "the vendored upstream @x402/svm 2.26.0 facilitator enforces an exact amount on its static path (scheme_exact_svm.md §3.1), a stricter sponsor policy pay-kit inherits by default (RULINGS S5); the fix belongs upstream in the x402 fork"
+tracking = "FINDINGS.md#x402-overpayment-rejected"
+
+[[known_failing]]
+id = "vector/x402-exact-verify-extra-required-signer-reject"
+reason = "the vendored upstream @x402/svm static path accepts a third required signer (scheme_exact_svm.md §2.1.4); maxRequiredSignatures is unset in pay-kit (typescript/packages/pay-kit/src/config.ts:48)"
+tracking = "FINDINGS.md#x402-extra-required-signer-accepted"
+
+[[known_failing]]
+id = "vector/charge-build-sol-token-program-reject"
+reason = "the client builds a SOL charge whose challenge carries tokenProgram (typescript/packages/mpp/src/client/Charge.ts:331)"
+tracking = "FINDINGS.md#charge-client-sol-token-program-ignored"
+
+[[known_failing]]
+id = "vector/charge-build-unknown-network-reject"
+reason = "the client builds for network \"testnet\" and falls back to the mainnet RPC (typescript/packages/mpp/src/client/Charge.ts:187)"
+tracking = "FINDINGS.md#charge-client-unknown-network"
+
+[[known_failing]]
+id = "vector/charge-build-too-many-splits-reject"
+reason = "the client builds nine splits; no length check (typescript/packages/mpp/src/client/Charge.ts:204)"
+tracking = "FINDINGS.md#ts-charge-client-split-cap"
+
+[[known_failing]]
+id = "vector/charge-build-amount-overflow-reject"
+reason = "amount 2^64 is refused only because the u64 codec throws; no u64 check at typescript/packages/mpp/src/client/Charge.ts:205"
+tracking = "FINDINGS.md#charge-client-amount-not-u64-validated"
+
+[[known_failing]]
+id = "vector/charge-verify-ata-not-idempotent-reject"
+reason = "an ATA Create with empty data throws a TypeError (typescript/packages/mpp/src/server/Charge.ts:689) instead of the policy rejection"
+tracking = "FINDINGS.md#ts-charge-ata-empty-data-crash"
+
+[[known_failing]]
+ids = [
+  "interop/charge-client-wrong-network/typescript/rust",
+]
+reason = "the client submits a credential for a challenge naming another cluster (draft-solana-charge-00: \"Clients MUST reject challenges whose network does not match their configured cluster\")"
+tracking = "FINDINGS.md#charge-client-network-not-checked"
+
+[[known_failing]]
+ids = [
+  "interop/charge-client-over-asking-price/typescript/rust",
+]
+reason = "the client pays a challenge whose amount was multiplied by 10000 after the server bound it; nothing checks the amount against what it was asked to pay (core: \"Clients MUST verify before authorizing payment\")"
+tracking = "FINDINGS.md#charge-client-request-not-verified"
+
+[[known_failing]]
+ids = [
+  "interop/charge-client-mis-signed-challenge/typescript/rust",
+]
+reason = "the client pays a challenge whose recipient was replaced after the server bound its id (core: \"Clients MUST verify before authorizing payment ... Recipient/address is expected\")"
+tracking = "FINDINGS.md#charge-client-request-not-verified"
+
+[[known_failing]]
+ids = [
+  "interop/x402-exact-cross-route-replay/rust/typescript",
+]
+reason = "rejects the cross-route payment with payment_invalid (sdkCode accepted_mismatch) instead of the canonical charge_request_mismatch"
+tracking = "FINDINGS.md#x402-canonical-codes"

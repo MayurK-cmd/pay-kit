@@ -1,5 +1,13 @@
 {
   "language": "php",
-  "command": ["php", "conformance/runner.php"],
+  "command": [
+    "php",
+    "conformance/runner.php"
+  ],
+  "serve": [
+    "php",
+    "conformance/runner.php",
+    "--serve"
+  ],
   "cwd": "php"
 }
