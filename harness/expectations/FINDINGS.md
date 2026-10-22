@@ -67,27 +67,29 @@ on a party outside the client and the sponsor.
 ## charge-client-sol-token-program-ignored
 
 **Case:** `vector/charge-build-sol-token-program-reject`
-**SDKs:** go, python, rust, swift, typescript
+**SDKs:** go, python, swift, typescript
 
 draft-solana-charge-00 Method Details, tokenProgram: “MUST NOT be present when
-currency is "sol".” Every client builds the SOL transfer and ignores the
-field: Rust `rust/crates/kit/src/mpp/client/charge.rs:376`, TypeScript
+currency is "sol".” Rust refuses (`validate_challenge_details`,
+`rust/crates/kit/src/mpp/client/charge.rs`). The others build the SOL
+transfer and ignore the field: TypeScript
 `typescript/packages/mpp/src/client/Charge.ts:331`, Go
 `go/protocols/mpp/client/charge.go:92`, Python
 `python/src/solana_pay_kit/protocols/mpp/client/charge.py:208`, Swift
 `swift/Sources/SolanaPayKit/Protocols/Mpp/Client/Charge.swift:319`. A client
 that cannot tell a malformed challenge from a valid one pays challenges a
-server never meant to issue (the Rust case carries a `kit_divergence`).
+server never meant to issue.
 
 ## charge-client-fee-payer-without-key
 
 **Case:** `vector/charge-build-fee-payer-without-key-reject`
-**SDKs:** go, python, rust
+**SDKs:** go, python
 
 Method Details, feePayer: “When true, the feePayerKey field MUST also be
-present.” TypeScript (`typescript/packages/mpp/src/client/Charge.ts:197`) and
+present.” TypeScript (`typescript/packages/mpp/src/client/Charge.ts:197`),
 Swift (`swift/Sources/SolanaPayKit/Protocols/Mpp/Client/Charge.swift:216`)
-refuse; Rust (`rust/crates/kit/src/mpp/client/charge.rs:333`), Go
+and Rust (`validate_challenge_details`,
+`rust/crates/kit/src/mpp/client/charge.rs`) refuse; Go
 (`go/protocols/mpp/client/charge.go:87`) and Python
 (`python/src/solana_pay_kit/protocols/mpp/client/charge.py:169`) silently fall
 back to a client-paid transaction, so the client pays fees the challenge
@@ -245,6 +247,23 @@ other x402 verifier caps the unit price alone:
   (`typescript/external/x402/typescript/packages/mechanisms/svm/src/exact/facilitator/scheme.ts:1246`).
   SOLA1-340 bounded the product in the TypeScript MPP charge only.
 
+## session-open-initial-voucher-accepted
+
+**Case:** `vector/session-wire-action-open-initial-voucher-reject`
+**SDKs:** typescript, python
+
+draft-solana-session-00 §Action "open": “`Action: "open"` MUST NOT carry an
+initial voucher. The first voucher is exchanged off-chain in a subsequent
+metered request, after the channel is confirmed on-chain.” Both session
+wire schemas special-case the forbidden `bump` field (TypeScript:
+`bump: z.optional(z.never())` in `typescript/packages/mpp/src/Methods.ts`;
+Python: `open payload must not include bump` in
+`python/src/solana_pay_kit/protocols/mpp/intents/session.py`) but drop or
+ignore every other unknown key, so an open carrying a `voucher` parses and
+re-encodes without it. Rust's `OpenPayload` is `deny_unknown_fields`. Fix:
+refuse a `voucher` key on the open payload (or refuse unknown keys
+outright).
+
 ## Interop findings (`pkc run --tier interop`, 2026-10-20)
 
 Recorded by the first run of the interop tier with every adapter paired
@@ -254,35 +273,38 @@ side the gap belongs to. The SDK sources were not changed.
 
 ## charge-client-network-not-checked
 
-**Cases:** `charge-client-wrong-network/{go,kotlin,rust,swift,typescript}/rust`
+**Cases:** `charge-client-wrong-network/{go,kotlin,swift,typescript}/rust`
 
 The fault proxy rewrites the Rust server's challenge to `methodDetails.network
-= "mainnet"` while the client pays a localnet validator. Every client builds
-and submits a credential. draft-solana-charge-00: “Clients MUST reject
-challenges whose network does not match their configured cluster.” Only the
-TypeScript adapter receives a network (`MPP_HARNESS_NETWORK`), and its SDK
-does not compare it either.
+= "mainnet"` while the client pays a localnet validator. These clients build
+and submit a credential. draft-solana-charge-00: “Clients MUST reject
+challenges whose network does not match their configured cluster.” Every
+client adapter receives the cluster (`MPP_HARNESS_NETWORK`); the Rust client
+passes it as `BuildChargeTransactionOptions::expected_network` and refuses.
+The TypeScript SDK does not compare it.
 
 ## charge-client-request-not-verified
 
 **Cases:** `charge-client-over-asking-price/*/rust`,
-`charge-client-mis-signed-challenge/*/rust` (go, kotlin, rust, swift, typescript)
+`charge-client-mis-signed-challenge/*/rust` (go, kotlin, swift, typescript)
 
 The proxy multiplies the challenged amount by 10 000, or swaps the recipient,
-after the server bound the challenge id. Every client pays. Core: “Clients
+after the server bound the challenge id. These clients pay. Core: “Clients
 MUST verify before authorizing payment: 1. Requested amount is reasonable for
-the resource 2. Recipient/address is expected”. No client SDK exposes an
-expected amount or recipient, and the adapter contract passes none; in pull
-mode the server's challenge binding is what keeps the funds safe (the
-proxy-observed credential never settles).
+the resource 2. Recipient/address is expected”. Client adapters receive the
+scenario amount and recipient (`MPP_HARNESS_AMOUNT`, `MPP_HARNESS_PAY_TO`);
+the Rust client pins them (`max_amount_base_units`, `expected_recipient`) and
+refuses. In pull mode the server's challenge binding is what keeps the funds
+safe (the proxy-observed credential never settles).
 
 ## x402-client-network-not-checked
 
-**Cases:** `x402-exact-client-wrong-network/{go,kotlin,python,rust,swift}/rust`
+**Cases:** `x402-exact-client-wrong-network/{go,kotlin,python,swift}/rust`
 
 The proxy rewrites every `accepts[].network` to solana mainnet while the
 client is configured (`X402_HARNESS_NETWORK`) for the devnet CAIP-2 id. These
-clients still pay; the TypeScript client refuses.
+clients still pay; the TypeScript and Rust clients refuse (Rust: a configured
+`ChallengeSelection::network` never falls back to another network).
 
 ## charge-canonical-codes-php-lua
 
@@ -302,11 +324,11 @@ route a cross-route credential comes from returns 404. Adapter gap.
 
 ## charge-decimals-9-servers
 
-**Cases:** `charge-decimals-9/*/rust`, `charge-decimals-9/rust/{go,lua,php}`
+**Cases:** `charge-decimals-9/rust/{go,lua,php}`
 
-A 9-decimal mint at amount 1000: the Rust harness server prices
-`price × 10^decimals` (1 000 000, not the scenario's 1000), Go and Lua exit
-before readiness, PHP answers 402. Previously masked by `serverIds:
+A 9-decimal mint at amount 1000: Go and Lua exit before readiness, PHP answers
+402. (The Rust adapter priced `MPP_HARNESS_PRICE × 10^decimals`, 1 000 000; it
+now charges `MPP_HARNESS_AMOUNT` like every other server.) Previously masked by `serverIds:
 ["typescript", "ruby"]`.
 
 ## charge-sol-native-servers
@@ -328,12 +350,11 @@ TypeScript x402 servers serve it. Adapter gap; the case never ran before
 
 ## x402-canonical-codes
 
-**Cases:** `x402-exact-idempotent-resubmit/*/rust` and
-`/rust/{go,lua,php,ruby,ruby-x402-server}`,
+**Cases:** `x402-exact-idempotent-resubmit/rust/{go,lua,php,ruby,ruby-x402-server}`,
 `x402-exact-cross-route-replay/rust/typescript`
 
 A second presentation of a settled x402 payment is refused (402) without the
-canonical `signature_consumed`: Rust says `payment_invalid`, Go returns a
+canonical `signature_consumed`: Go returns a
 fresh challenge with no code, Lua and PHP `invalid_proof`, Ruby a raw RPC
 error. TypeScript rejects a cross-route payment with `payment_invalid`
 (sdkCode `accepted_mismatch`) instead of `charge_request_mismatch`. x402 has
@@ -355,136 +376,57 @@ Open findings from the x402 `upto` (SVM) vectors (`x402-upto-*.json`,
 half of `X402Upto::verify_open_for_route`, co-signature included);
 TypeScript through the vendored `@x402/svm` 2.26.0 upto facilitator's
 read-only `verify` (pay-kit's `X402Upto.verifyOpen` calls `settle`, which
-broadcasts). Each Rust divergence is also recorded on its registry entry
-(`authored(Some(reason))`).
-
-## upto-client-settle-fields-accepted
-
-**Cases:** `vector/x402-upto-verify-client-voucher-reject`, `-client-voucher-empty-reject`, `-client-type-reject`
-**SDKs:** rust
-
-scheme_upto_svm.md Phase 3 step 0: “voucherSignature is claim-only and
-server-owned; presence on the client payload (including an empty string or
-undefined value) MUST fail with invalid_upto_svm_payload_unexpected_voucher”,
-and for `type` “presence on the client payload MUST fail with
-invalid_upto_svm_payload_type”. `UptoPayload`
-(`rust/crates/kit/src/x402/protocol/schemes/upto/types.rs`) models neither
-field and serde drops unknown keys, so `prepare_open`
-(`rust/crates/kit/src/x402/server/upto.rs:566`) accepts both.
-
-## upto-lifetime-unbounded
-
-**Cases:** `vector/x402-upto-verify-expires-beyond-timeout-reject`, `-timeout-over-lifetime-reject`, `-expires-over-lifetime-reject`
-**SDKs:** rust
-
-Phase 3 step 7: “Reject when maxTimeoutSeconds or remaining expiresAt - now
-exceeds the facilitator's maxChannelLifetimeSecs, or when expiresAt is later
-than now + maxTimeoutSeconds (plus clock skew).” `verify_upto_payload`
-(`rust/crates/kit/src/x402/protocol/schemes/upto/verify.rs:21`) checks only
-`validAfter <= now < expiresAt`, and `UptoConfig` has no lifetime ceiling. A
-client can authorize a channel whose voucher deadline is days out; abandon-close
-MUST NOT run before `expiresAt`, so the sponsor's rent stays locked.
+broadcasts).
 
 ## upto-channel-exists-not-checked
 
 **Case:** `vector/x402-upto-verify-channel-already-open-reject`
-**SDKs:** rust, typescript
+**SDKs:** typescript
 
 Phase 3 step 4: “Confirm the channel account does not already exist. If it
-does, reject with invalid_upto_svm_channel_already_open.” (RULINGS U2.) Rust
-co-signs without reading the channel account (`prepare_open`); the vendored
-TS facilitator checks it only in `settle` (deposit), not in `verify`
+does, reject with invalid_upto_svm_channel_already_open.” (RULINGS U2.) The
+vendored TS facilitator checks it only in `settle` (deposit), not in `verify`
 (`typescript/external/x402/typescript/packages/mechanisms/svm/src/upto/facilitator/scheme.ts:400`).
-
-## upto-payer-signature-not-verified
-
-**Cases:** `vector/x402-upto-verify-missing-payer-signature-reject`, `-invalid-payer-signature-reject`
-**SDKs:** rust
-
-“The payload.from signature MUST be present and valid before the facilitator
-signs.” Neither `prepare_open` nor `cosign_fee_payer` verifies the payer's
-slot, so the sponsor co-signs (and in production broadcasts, paying the fee)
-a transaction that cannot land.
-
-## upto-signer-set-not-checked
-
-**Case:** `vector/x402-upto-verify-extra-signer-reject`
-**SDKs:** rust
-
-“The complete required-signer set MUST equal the distinct addresses in {
-payload.from, extra.feePayer }.” The vector adds a third required signer on
-the Memo. `scan_channel_tx_layout`
-(`rust/crates/kit/src/core/payment_channel/v1.rs:986`) checks wrapper accounts
-only for the fee payer. Same class as `x402-extra-required-signer-accepted`.
-
-## upto-open-privileges-not-checked
-
-**Cases:** `vector/x402-upto-verify-writable-mint-reject`, `vector/x402-upto-verify-open-extra-account-reject`
-**SDKs:** rust
-
-“contain exactly the following 14 account positions in order, and contain no
-remaining accounts” and “No account outside the writable roles in the table
-(including an intentional equal-key union) may be writable.”
-`validate_open_instruction` (`rust/crates/kit/src/x402/server/upto.rs:1384`)
-compares the keys at positions 0 to 13 and ignores both writable flags and a
-fifteenth account.
-
-## upto-second-memo-refused
-
-**Case:** `vector/x402-upto-verify-two-memos-unbound-accept`
-**SDKs:** rust
-
-The suffix is “at most four instructions, each invoking either Lighthouse ...
-or SPL Memo”; exactly one Memo is required only “If extra.memo is present”.
-`scan_channel_tx_layout` refuses a second Memo under `MemoPolicy::Optional`
-(`rust/crates/kit/src/core/payment_channel/v1.rs:1107`). Stricter than the
-spec; a wallet that adds its own memo to an unbound open is refused.
-
-## upto-seed-fields-textual
-
-**Cases:** `vector/x402-upto-verify-nonce-not-decimal-reject`, `-open-slot-not-decimal-reject`
-**SDKs:** rust
-
-`nonce` is a “Unique decimal u64 salt”. Rust compares `payload.nonce` and
-`payload.openSlot` with the decoded open arguments as text and reports a
-binding mismatch (`open-binding-mismatch`) instead of a malformed payload
-(`invalid-payload`).
 
 ## upto-slot-wire-type
 
-**Cases:** `vector/x402-upto-verify-open-slot-number-accept` (rust, typescript), `vector/x402-upto-build-recent-slot-number` (rust)
-**SDKs:** rust, typescript
+**Case:** `vector/x402-upto-verify-open-slot-number-accept`
+**SDKs:** typescript
 
 The pinned §4.2 table types `openSlot` as `number`, §4.1 types `recentSlot` as
-`number`, and both §4.1 examples carry `"recentSlot": 341000000`. Every SDK
-emits and requires decimal strings: Rust `UptoPayload.open_slot` and
-`UptoExtra.recent_slot` are `String`
-(`rust/crates/kit/src/x402/protocol/schemes/upto/types.rs:62`, `:168`), so the
-spec's own example challenge fails to parse and the Rust client cannot pay
-it; TS `isUptoSvmPayload` requires a string `openSlot`
-(`typescript/external/x402/typescript/packages/mechanisms/svm/src/types.ts:79`).
-See RULINGS U1; the fix is upstream spec text or parsers that accept both.
+`number`, and both §4.1 examples carry `"recentSlot": 341000000`. TS
+`isUptoSvmPayload` requires a string `openSlot`
+(`typescript/external/x402/typescript/packages/mechanisms/svm/src/types.ts:79`),
+so the spec's own number form is refused. Rust reads both forms
+(`Slot` in `rust/crates/kit/src/x402/protocol/schemes/upto/types.rs`). See
+RULINGS U1; the fix is upstream spec text or parsers that accept both.
 
-## upto-client-memo-nonce-missing
+## go-upto-client-expires-beyond-timeout
 
-**Case:** `vector/x402-upto-build-memo-nonce`
-**SDKs:** rust
+**Cases:** `interop/x402-upto-basic/go/rust`, `interop/x402-upto-zero-actual/go/rust`
+**SDKs:** go
 
-“Clients MUST include a Memo instruction containing either the value of
-extra.memo (when present) or a random nonce (at least 16 bytes, hex-encoded
-for UTF-8 compliance).” `build_upto_payload`
-(`rust/crates/kit/src/x402/client/upto/payment.rs:103`) emits a Memo only when
-the challenge declares one, so two opens with identical parameters are
-byte-identical.
+scheme_upto_svm.md Phase 3 step 7: “Reject when maxTimeoutSeconds or remaining
+expiresAt - now exceeds the facilitator's maxChannelLifetimeSecs, or when
+expiresAt is later than now + maxTimeoutSeconds (plus clock skew).” The Go
+upto client adapter passes `time.Now().Add(time.Hour)` as `expiresAt`
+(`harness/go-client/main.go:168`) whatever the challenge's
+`maxTimeoutSeconds` (300 in the scenario), so the Rust server refuses it
+with `invalid_upto_svm_payload_expires_at_mismatch`. The Python, Swift and
+Kotlin adapters use `now + maxTimeoutSeconds`.
 
-## upto-v1-loaded-limit-strict
+## go-upto-server-memo-suffix-refused
 
-**Case:** `vector/x402-upto-verify-v1-small-loaded-limit-accept`
-**SDKs:** rust (typescript fails it under `ts-upto-no-transaction-versions`)
+**Case:** `interop/x402-upto-basic/rust/go`
+**SDKs:** go
 
-x402-txv1 scheme_upto_svm.md: “loadedAccountsDataSizeLimit MUST be present”.
-`check_v1_budget_caps` (`rust/crates/kit/src/core/tx/policy.rs:131`) requires
-it to equal 64 MiB and rejects a version-1 open that budgets less loaded data.
+The acceptance policy allows “An optional suffix of at most four
+instructions, each invoking either Lighthouse ... or SPL Memo”, and “Clients
+MUST include a Memo instruction containing either the value of extra.memo
+(when present) or a random nonce”. `validateUptoOpenInstruction`
+(`go/protocols/x402/upto.go:795`) requires the open to be the only
+instruction, so a spec-conforming client open on an unbound route (the Rust
+client's random-nonce Memo) is refused.
 
 ## ts-upto-open-trailing-bytes
 
@@ -520,68 +462,6 @@ advertises, and its facilitator cannot decode a version-1 message (it throws
 reading the absent lookup-table list), so neither
 `unsupported_transaction_version` nor the version-1 budget rules are reachable.
 Resolved by bumping the vendored x402 packages once PR 3710 lands.
-## txv1-rust-legacy-accepted
-
-**Cases:** `vector/charge-verify-legacy-reject`, `vector/charge-verify-legacy-default-reject`, `vector/session-open-legacy-reject`
-**SDKs:** rust
-
-The MPP txv1 draft (draft-solana-charge-00, Transaction Versions): “Legacy
-messages are not supported: servers MUST NOT advertise "legacy" and MUST
-reject a legacy message.” The kit polices a legacy message as version 0
-(`rust/crates/kit/src/core/tx/version.rs`, `TxVersion::of`) and its charge
-verifier accepts one wherever version 0 is accepted. That reading matches
-x402 (§1.5, a facilitator MAY keep accepting legacy), not MPP. The fix is a
-protocol-aware envelope check: MPP charge and session refuse
-`VersionedMessage::Legacy`; x402 keeps the tolerance.
-
-## txv1-rust-empty-advertisement
-
-**Cases:** `vector/charge-build-empty-advertisement-reject`, `vector/x402-build-empty-advertisement-reject`
-**SDKs:** rust
-
-`transactionVersions: []` is read as the absent default `[0]`
-(`core::tx::accepted_versions`) and the client builds version 0. Only an
-omitted field defaults (RULINGS T2); x402 §1.5: “It MUST fail with
-unsupported_transaction_version when the intersection is empty.”
-
-## txv1-rust-x402-legacy-offer-code
-
-**Case:** `vector/x402-build-legacy-only-reject`
-**SDKs:** rust
-
-An offer whose `extra.transactionVersions` is `["legacy"]` fails to parse
-(`PaymentRequirements` deserialization, `invalid-payload`). §1.5 says the
-client intersects and, legacy never being buildable, fails with
-`unsupported_transaction_version`. The refusal is right; the code is not.
-
-## txv1-rust-x402-budget-codes
-
-**Case:** `vector/x402-verify-v1-missing-loaded-data-limit-reject`
-**SDKs:** rust
-
-`verify_exact_versioned_transaction`
-(`rust/crates/kit/src/x402/protocol/schemes/exact/verify.rs`) maps every
-`check_v1_budget_caps` error to
-`invalid_exact_svm_payload_transaction_instructions_compute_price_instruction_too_high`,
-so a version-1 header without `loadedAccountsDataSizeLimit` (or with a zero
-limit) is reported as a price-cap violation. The transaction is rejected;
-only the reason is wrong.
-
-## txv1-rust-x402-advertisement-fixed
-
-**Cases:** `cross/x402-build-v0-advertised/*/rust`, `cross/x402-build-duplicate-advertisement/*/rust`
-**SDKs:** rust
-
-§1.5: “the server MUST copy that value into
-PaymentRequirements.extra.transactionVersions.” The kit's x402 server
-generates the field itself from `TxV1Mode` (`core::tx::advertised`): `[0, 1]`
-or nothing. Fronting a facilitator that advertises `[0]` (or `[1, 0, 1]`),
-its route carries a different value than the offer the client echoed, and
-the accepted match (“a hint the credential does echo must still equal the
-route's”, `rust/crates/kit/src/x402/server/exact.rs` `drop_hints_not_echoed`)
-refuses a valid payment. The builds verify against a route that copies the
-offer's value (the build judge's sponsor).
-
 ## txv1-ts-mpp-no-transaction-versions
 
 **Cases:** `vector/charge-wire-transaction-versions-*`, `vector/session-wire-transaction-versions-*`
@@ -729,96 +609,19 @@ that recorded them. Rust divergences are recorded on the cases
 (`authored(Some(reason))`), so fixing the kit fails the case until the note
 is removed.
 
-## subscription-rust-client-kit-extensions
-
-**Case:** `vector/subscription-build-spec-request`
-**SDKs:** rust
-
-The Rust client builds `SubscribeData` from methodDetails fields only the
-Rust server emits (`amount`, `recipient`, `merchant`, `planIdNumeric`,
-`planBump`, `expectedPeriodHours`, `expectedCreatedAt`) and refuses a
-challenge without them
-(`rust/crates/kit/src/mpp/protocol/intents/subscription.rs:176`,
-`rust/crates/kit/src/mpp/client/subscription.rs:266`). A spec-shaped
-challenge, which is what `@solana/mpp`'s server issues, carries none of
-them: the plan terms are on-chain. The Rust client cannot activate against
-the TypeScript server. Fix: read the Plan account (as the TypeScript client
-does) and treat the extensions as an optimisation that must agree with it.
-
-## subscription-rust-request-format
-
-**Cases:** `vector/subscription-build-amount-leading-zero-reject`,
-`-zero-amount-reject`, `-period-count-leading-zero-reject`,
-`-token-program-not-spl-reject`, `-no-decimals-reject`,
-`vector/subscription-period-count-leading-zero-reject`, `-sign-reject`
-**SDKs:** rust
-
-“The amount value MUST be a string representation of a positive integer in
-base 10 with no sign, decimal point, exponent, or surrounding whitespace.
-Leading zeros MUST NOT be used.” (the same holds for periodCount). The kit
-parses both with `u64::from_str`, which accepts `"010000000"`, `"0"`, `"030"`
-and `"+30"` (`rust/crates/kit/src/mpp/protocol/intents/subscription.rs:201-212`).
-The builder accepts any `tokenProgram` (“The value MUST be the SPL Token
-program or the SPL Token-2022 program”,
-`rust/crates/kit/src/mpp/client/subscription.rs:224`), and `decimals` is
-optional (`rust/crates/kit/src/mpp/protocol/intents/subscription.rs:322`)
-though the table marks it REQUIRED. Two encodings of one set of terms break
-the uniqueness of the challenge's canonical bytes.
-
-## subscription-rust-client-plan-unread
-
-**Cases:** `vector/subscription-build-plan-missing-reject`,
-`-plan-amount-mismatch-reject`, `-plan-period-mismatch-reject`,
-`-plan-mint-mismatch-reject`, `-plan-puller-unauthorized-reject`,
-`-plan-no-destination-reject`, `-plan-two-destinations-reject`,
-`-plan-other-destination-reject`
-**SDKs:** rust (all eight); typescript for the puller and destination cases
-(`subscription-ts-plan-pullers-destinations`)
-
-“Clients MUST NOT sign an activation transaction whose on-chain Plan does not
-match the challenge.” and “Servers and clients MUST reject request objects
-referencing a plan with an empty destination whitelist, more than one non-zero
-destination, or a destination different from recipient.” The Rust client
-never reads the Plan. The program's `Subscribe` re-checks the terms it is
-handed, but nothing catches a plan whose destinations or pullers differ from
-what the wallet displays.
-
 ## subscription-source-not-verified
 
 **Cases:** `vector/subscription-verify-source-other-address-reject`,
 `vector/subscription-verify-source-other-method-reject`
-**SDKs:** rust, typescript
+**SDKs:** typescript (Rust fixed: `verify_credential_source` in
+`rust/crates/kit/src/mpp/server/subscription.rs`)
 
 “If source is present, servers MUST verify that it uses the did:pkh:solana:
 method and that its address matches the subscriber signer extracted from the
-activation transaction.” Neither server reads `credential.source`
-(`rust/crates/kit/src/mpp/server/subscription.rs:420`,
-`typescript/packages/mpp/src/server/Subscription.ts:230`). Both derive the
-payer from the transaction, so payment is unaffected, but an application that
-logs or keys on `source` trusts an unverified value.
-
-## subscription-rust-sponsor-fee-payer-code
-
-**Case:** `vector/subscription-verify-sponsor-not-fee-payer-reject`
-**SDKs:** rust
-
-A sponsored challenge whose activation names the subscriber as fee payer is
-rejected as “Could not identify subscriber among transaction signers”
-(`rust/crates/kit/src/mpp/server/subscription.rs:1867`) rather than as a fee
-payer mismatch: `extract_subscriber_from_tx` skips signer 0 assuming it is the
-sponsor and runs before the fee-payer check in `validate_activation_scope`.
-The verdict is right, the category is not.
-
-## subscription-rust-wire-optional-authentication
-
-**Case:** `vector/subscription-wire-activation-no-authentication-reject`
-**SDKs:** rust
-
-`ActivatePayload.authentication` is an `Option`
-(`rust/crates/kit/src/mpp/protocol/intents/subscription.rs:260`), so the wire
-type accepts an activation without the REQUIRED proof; `verify_credential`
-rejects it later. Making the field required moves the check to the parse
-boundary.
+activation transaction.” The TypeScript server does not read
+`credential.source` (`typescript/packages/mpp/src/server/Subscription.ts:230`).
+It derives the payer from the transaction, so payment is unaffected, but an
+application that logs or keys on `source` trusts an unverified value.
 
 ## subscription-ts-recipient-ata
 
@@ -949,6 +752,15 @@ binding key. The other open-path rejects (`diverting-distribution`,
 therefore match by code only: Rust reaches the same `setup_transaction` at the
 memo scan. They become discriminating once the server accepts the binding memo.
 
+**Resolved in Rust:** the client adds the binding memo after the seller memo on
+every open (both voucher modes), and the server's open policy
+(`MemoPolicy::RequiredWithBinding`) requires exactly one seller memo and
+exactly one binding memo, refusing a binding to any key other than its
+`extra.receiverAuthorizer` with `receiver_authorizer_mismatch`. The server
+always advertises a receiver authorizer (the fee payer's key unless
+configured), and `check_channel_config` requires it on both sides. The kit
+exposes `receiver_binding_memo` / `parse_receiver_binding_memo`.
+
 ## batch-refund-superseded-shape
 
 **Cases:** `batch-build-refund`, `batch-verify-refund-*` (all but
@@ -968,6 +780,20 @@ and the server refuses any refund carrying a voucher with `close_authorization`
 therefore unreachable with a conforming payload; the vectors pin the spec's
 retry path (voucher plus transaction, binding unavailable).
 
+**Resolved in Rust:** `BatchPayload::Refund` carries a `BatchRefund` whose
+`RefundSigner` is exactly one of the client-mode voucher or the server-mode
+proof (a refund with neither does not parse, under `payload_type`), with the
+`request_close` transaction optional. `build_refund` builds the cooperative
+refund (the accepted cumulative as a voucher) and `build_refund_request_close`
+the retry. The server refuses a voucher other than its accepted cumulative
+(`close_state`), a client-supplied `closeAuthorization`, a server-mode refund
+(`payload_type`) and, without a transaction, a channel whose recorded
+receiver binding is absent (`receiver_binding_unavailable`) or foreign;
+otherwise it fences the record and closes cooperatively with
+`settle_and_seal` plus the sealed `distribute`. The kit exposes
+`close_authorization_digest`, `sign_close_authorization` and
+`verify_close_authorization`.
+
 ## batch-claims-unbounded
 
 **Cases:** `batch-wire-redemption-claim-empty-reject`,
@@ -978,6 +804,9 @@ fit in a legacy Solana transaction without address lookup tables.” The kit's
 `BatchRedemptionPayload::Claim` is an unbounded `Vec`; the server never
 receives a claim payload over the wire (it redeems through its own
 `claim()`), so this only matters to a facilitator built on the wire type.
+
+**Resolved in Rust:** `claims` and `channels` are a `RedemptionBatch`, whose
+constructor and deserializer refuse fewer than one or more than four entries.
 
 ## batch-server-reject-codes
 
@@ -997,6 +826,15 @@ An unadvertised message version comes back as `setup_transaction`; x402-txv1
 requires the facilitator to reject it “before inspecting any instruction,
 with `unsupported_transaction_version`”.
 
+**Resolved in Rust:** an `accepted` mismatch is `invalid_payment_requirements`
+and a non-v2 envelope `invalid_x402_version` (the x402 v2 §9 standard codes;
+the shared vocabulary maps them to `accepted-mismatch` and
+`unsupported-version`, RULINGS B3), an unusable settlement ATA is
+`settlement_simulation`, an unadvertised message version
+`unsupported_transaction_version` (setup and `request_close` alike), and a
+non-integer `extra.withdrawDelay` fails parsing with
+`withdraw_delay_out_of_range`.
+
 ## batch-v1-loaded-limit-pinned
 
 **Cases:** `batch-txv1-top-up-v1-loaded-limit-below-max` (rust)
@@ -1006,6 +844,12 @@ x402-txv1: “`loadedAccountsDataSizeLimit` MUST be present”. The kit's
 runtime maximum (67108864), refusing a version-1 setup transaction that
 declares a smaller limit. The spec sets presence, not a value, and lets a
 sponsor tighten only the caps it names.
+
+**Resolved in Rust (batch only):** the batch sponsor policy uses
+`core::tx::check_v1_budget_caps_loaded_limit_present` (present, positive, at
+most 67108864). `check_v1_budget_caps`, shared with MPP session and x402
+`upto`, still pins the maximum
+([upto-v1-loaded-limit-strict](#upto-v1-loaded-limit-strict)).
 
 ## batch-voucher-onchain-bindings
 
@@ -1021,6 +865,10 @@ grace period, open slot and distribution hash, so a foreign payee or a
 distribution that does not pay `payTo` is refused. It does not read the
 account discriminator: an account carrying `ClosedChannel` still serves a
 steady-state voucher.
+
+**Resolved in Rust:** `decode_channel_account` refuses any account whose
+discriminator is not `Channel` (1) with `channel_state`, so a refresh onto a
+`ClosedChannel` account refuses the voucher.
 
 ### TypeScript: vendored upstream `@x402/svm` 2.26.0
 
