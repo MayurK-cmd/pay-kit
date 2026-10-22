@@ -57,6 +57,7 @@ tracking = "FINDINGS.md#charge-client-request-not-verified"
 ids = [
   "interop/charge-decimals-9/go/rust",
   "interop/charge-decimals-9/kotlin/rust",
+  "interop/charge-decimals-9/python/rust",
   "interop/charge-decimals-9/rust/rust",
   "interop/charge-decimals-9/swift/rust",
   "interop/charge-decimals-9/typescript/rust",
