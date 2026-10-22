@@ -14,15 +14,19 @@
 //! stale signature (except [`Mutation::DropSignature`], whose point that
 //! is). Only [`Mutation::ToFormat`] changes the format.
 
+use ed25519_dalek::Signer;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_message::{v1::TransactionConfig, VersionedMessage};
+use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 
 use crate::case::{RejectCode, Suite};
 use crate::keys::{
     self, ata, pubkey, ATA_PROGRAM, MEMO_PROGRAM, SYSTEM_PROGRAM, TOKEN_2022_PROGRAM, TOKEN_PROGRAM,
 };
-use crate::tx::{compile_as, decompile, recompile, sign_slots, v1_config, MessageFormat};
+use crate::tx::{
+    compile_as, compile_v0, decompile, recompile, sign_slots, v1_config, MessageFormat,
+};
 
 /// Selects the n-th (0-based) value transfer: System `Transfer` or SPL
 /// `TransferChecked`, in instruction order.
@@ -72,6 +76,13 @@ pub enum Mutation {
     SetComputeUnitPrice { micro_lamports: u64 },
     /// Zero the client's signature and do not re-sign.
     DropSignature,
+    /// Replace the client's signature with its valid signature over another
+    /// message, as a server sees a landed transaction's signature copied in:
+    /// well-formed bytes that do not verify over this message.
+    ForgeSignature,
+    /// Keep only the first `keep` signatures; the message still requires
+    /// all of them.
+    TruncateSignatures { keep: usize },
     /// Remove the n-th transfer (zero matching transfers).
     DropTransfer { transfer: TransferIndex },
     /// Duplicate the n-th transfer right after itself.
@@ -117,6 +128,16 @@ pub enum Mutation {
     /// Make the key of `seed` a required signer (a read-only signer account
     /// of the n-th Memo instruction) and sign with it.
     ExtraSigner { memo: usize, seed: [u8; 32] },
+    /// Fund transfer #n from the key of `seed` instead of the client, which
+    /// then signs as that leg's authority (SOL: the System transfer's source;
+    /// SPL: the owner of its own token account).
+    SecondAuthority {
+        transfer: TransferIndex,
+        seed: [u8; 32],
+    },
+    /// Make the key of `seed` a required signer that no instruction names,
+    /// and sign with it.
+    UnusedSigner { seed: [u8; 32] },
     /// Envelope: claim another network in `accepted.network` (x402 v2).
     WrongNetwork { network: &'static str },
     /// Challenge expiry in the past. Not expressible offline in the vector
@@ -171,7 +192,10 @@ impl Mutation {
             (SetComputeUnitPrice { .. }, Suite::Charge | Suite::X402Exact) => {
                 Some(ComputePriceOverCap)
             }
-            (DropSignature, Suite::Charge | Suite::X402Exact) => Some(InvalidPayload),
+            (
+                DropSignature | ForgeSignature | TruncateSignatures { .. },
+                Suite::Charge | Suite::X402Exact,
+            ) => Some(InvalidPayload),
             (DropTransfer { .. }, Suite::Charge | Suite::X402Exact) => Some(NoMatchingTransfer),
             (ExtraTransfer { .. }, Suite::Charge | Suite::X402Exact) => Some(UnexpectedInstruction),
             (DuplicateLegReuse { .. }, Suite::Charge) => Some(NoMatchingTransfer),
@@ -194,6 +218,8 @@ impl Mutation {
                 Some(UnexpectedInstruction)
             }
             (ExtraSigner { .. }, Suite::X402Exact) => Some(UnexpectedInstruction),
+            (SecondAuthority { .. }, Suite::Charge) => Some(MixedFundingAuthority),
+            (UnusedSigner { .. }, Suite::Charge) => Some(UnexpectedSigner),
             (DuplicateMemo { .. }, Suite::X402Exact) => Some(InvalidPayload),
             (Mutation::WrongNetwork { .. }, Suite::X402Exact) => Some(RejectCode::AcceptedMismatch),
             (V1ComputeUnitLimit { .. }, Suite::Charge | Suite::X402Exact | Suite::Session) => {
@@ -244,6 +270,12 @@ impl Mutation {
                 format!("compute unit price set to {micro_lamports} micro-lamports")
             }
             Mutation::DropSignature => "client signature zeroed".into(),
+            Mutation::ForgeSignature => {
+                "client signature replaced with its signature over another message".into()
+            }
+            Mutation::TruncateSignatures { keep } => {
+                format!("signatures cut to the first {keep}")
+            }
             Mutation::DropTransfer { transfer } => format!("transfer #{transfer} removed"),
             Mutation::ExtraTransfer { transfer } => format!("transfer #{transfer} duplicated"),
             Mutation::DuplicateLegReuse { transfer } => {
@@ -293,6 +325,14 @@ impl Mutation {
             Mutation::DuplicateMemo { memo } => format!("memo #{memo} duplicated"),
             Mutation::ExtraSigner { memo, seed } => format!(
                 "{} added as a required signer of memo #{memo}",
+                keys::pubkey_of_seed(*seed)
+            ),
+            Mutation::SecondAuthority { transfer, seed } => format!(
+                "transfer #{transfer} funded and signed by {}",
+                keys::pubkey_of_seed(*seed)
+            ),
+            Mutation::UnusedSigner { seed } => format!(
+                "{} added as a required signer no instruction names",
                 keys::pubkey_of_seed(*seed)
             ),
             Mutation::WrongNetwork { network } => format!("accepted.network set to {network}"),
@@ -353,6 +393,28 @@ impl Mutation {
                 .position(|k| *k == client)
                 .ok_or("client is not a signer of the transaction")?;
             out.signatures[index] = Default::default();
+            return Ok(out);
+        }
+        if let Mutation::ForgeSignature = self {
+            let mut out = tx.clone();
+            let client = keys::pubkey_of_seed(keys::CLIENT_SEED);
+            let index = out
+                .message
+                .static_account_keys()
+                .iter()
+                .position(|k| *k == client)
+                .ok_or("client is not a signer of the transaction")?;
+            let other =
+                keys::signing_key(keys::CLIENT_SEED).sign(b"a transaction that already landed");
+            out.signatures[index] = Signature::from(other.to_bytes());
+            return Ok(out);
+        }
+        if let Mutation::TruncateSignatures { keep } = self {
+            let mut out = tx.clone();
+            if *keep >= out.signatures.len() {
+                return Err(format!("{self:?} keeps every signature"));
+            }
+            out.signatures.truncate(*keep);
             return Ok(out);
         }
         match self {
@@ -640,9 +702,60 @@ impl Mutation {
                     .copied()
                     .collect();
             }
+            Mutation::SecondAuthority { transfer, seed } => {
+                let at = transfer_at(*transfer)?;
+                let authority = keys::pubkey_of_seed(*seed);
+                let ix = &mut d.instructions[at];
+                if ix.program_id == pubkey(SYSTEM_PROGRAM) {
+                    ix.accounts[0] = AccountMeta::new(authority, true);
+                } else {
+                    let mint = ix.accounts[1].pubkey.to_string();
+                    let program = ix.program_id.to_string();
+                    ix.accounts[0] =
+                        AccountMeta::new(ata(&authority.to_string(), &mint, &program), false);
+                    ix.accounts[3] = AccountMeta::new_readonly(authority, true);
+                }
+                let mut out = recompile(&tx.message, &d)?;
+                let mut seeds = signers.to_vec();
+                seeds.push(*seed);
+                sign_slots(&mut out, &seeds);
+                return Ok(out);
+            }
+            Mutation::UnusedSigner { seed } => {
+                let mut out = compile_v0(&d)?;
+                let VersionedMessage::V0(message) = &mut out.message else {
+                    unreachable!("compile_v0 builds a version-0 message")
+                };
+                // The new key joins the end of the signer block as a
+                // read-only signer; every later index shifts by one.
+                let at = message.header.num_required_signatures;
+                message
+                    .account_keys
+                    .insert(at as usize, keys::pubkey_of_seed(*seed));
+                message.header.num_required_signatures += 1;
+                message.header.num_readonly_signed_accounts += 1;
+                for ix in &mut message.instructions {
+                    if ix.program_id_index >= at {
+                        ix.program_id_index += 1;
+                    }
+                    for account in &mut ix.accounts {
+                        if *account >= at {
+                            *account += 1;
+                        }
+                    }
+                }
+                out.signatures =
+                    vec![Signature::default(); message.header.num_required_signatures as usize];
+                let mut seeds = signers.to_vec();
+                seeds.push(*seed);
+                sign_slots(&mut out, &seeds);
+                return Ok(out);
+            }
             Mutation::WrongNetwork { .. }
             | Mutation::ExpireChallenge
             | Mutation::DropSignature
+            | Mutation::ForgeSignature
+            | Mutation::TruncateSignatures { .. }
             | Mutation::ToFormat { .. }
             | Mutation::AddLookupTable
             | Mutation::V1ComputeUnitLimit { .. }
@@ -858,6 +971,17 @@ mod tests {
         let dropped = Mutation::DropSignature.apply(&tx, &[]).unwrap();
         assert_eq!(dropped.message, tx.message);
         assert_ne!(dropped.signatures, tx.signatures);
+        let forged = Mutation::ForgeSignature.apply(&tx, &[]).unwrap();
+        assert_eq!(forged.message, tx.message);
+        assert!(forged
+            .signatures
+            .iter()
+            .all(|s| *s != Signature::default() || tx.signatures.contains(s)));
+        assert_ne!(forged.signatures, tx.signatures);
+        let cut = Mutation::TruncateSignatures { keep: 1 }
+            .apply(&tx, &[])
+            .unwrap();
+        assert_eq!(cut.signatures.len(), 1);
     }
 
     #[test]

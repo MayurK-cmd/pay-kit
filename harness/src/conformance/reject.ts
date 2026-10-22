@@ -51,6 +51,9 @@ const PATTERNS: Array<[RegExp, RejectCode]> = [
   // incomplete header config, a size over the version's limit, a lookup
   // table. Checked first: the messages also contain generic words.
   [/transaction version .*not accepted|unsupported_transaction_version|signs up to version/i, "unsupported-version"],
+  // RULINGS SIG1: a client signature that does not verify over the message,
+  // or a signature list short of the required signers.
+  [/signature verification failed|signature slots do not match|invalid client transaction signature/i, "invalid-payload"],
   [/^(?!.*invalid_exact_svm).*must not contain computebudget instructions/i, "unexpected-instruction"],
   [/must set computeunitlimit|loaded accounts data size limit|-byte limit|address lookup tables/i, "invalid-payload"],
   // Charge verification policy (split arithmetic, split-recipient ATA
@@ -85,9 +88,16 @@ const PATTERNS: Array<[RegExp, RejectCode]> = [
   // Client refusing a challenge that violates the method spec (RULINGS C2,
   // C3). Checked first: these messages also contain generic words.
   [/decimals is required|failed to determine token program/i, "invalid-challenge"],
+  // @solana/pay-kit's client refusing an offer's terms (an unknown network).
+  [/invalid_challenge_terms|unsupported solana network/i, "invalid-challenge"],
+  // Sponsors bound the priority fee as limit x price (RULINGS S6).
+  [/priority fee .* exceeds the sponsored maximum/i, "compute-price-over-cap"],
   [/compute unit price .* exceeds maximum/i, "compute-price-over-cap"],
   [/compute unit limit .* exceeds maximum/i, "compute-limit-over-cap"],
   [/fee payer cannot authorize/i, "fee-payer-not-authority"],
+  // Fee-sponsored charges: one funding authority, no other signers.
+  [/share one funding authority/i, "mixed-funding-authority"],
+  [/unexpected signer/i, "unexpected-signer"],
   [/fee payer .* (funding source|funds source)/i, "fee-payer-is-funds-source"],
   [/splits consume the entire amount/i, "splits-exceed-amount"],
   [/too many splits/i, "too-many-splits"],
