@@ -5,6 +5,9 @@ use crate::x402::SOLANA_NETWORK;
 /// Exact payment scheme identifier.
 pub const EXACT_SCHEME: &str = "exact";
 
+/// `maxTimeoutSeconds` advertised when a requirement sets no `max_age`.
+pub(crate) const DEFAULT_MAX_TIMEOUT_SECONDS: u64 = 300;
+
 /// Maximum memo bytes accepted by the canonical SVM exact scheme.
 pub const MAX_MEMO_BYTES: usize = 256;
 
@@ -39,15 +42,17 @@ pub fn caip2_network_for_cluster(cluster: &str) -> &'static str {
 }
 
 /// Map a CAIP-2 network identifier back to a Solana cluster name.
+///
+/// Only the canonical genesis-hash identifiers and the listed aliases are
+/// recognized; any other `solana:*` identifier is an unknown network.
 pub fn cluster_for_caip2_network(network: &str) -> Option<&'static str> {
     match network {
-        SOLANA_NETWORK | "mainnet" | "mainnet-beta" => Some("mainnet-beta"),
-        "solana-devnet" | "devnet" | "localnet" => Some("devnet"),
-        "solana-testnet" | "testnet" => Some("testnet"),
+        SOLANA_NETWORK | "mainnet" | "mainnet-beta" | "solana:mainnet" => Some("mainnet-beta"),
+        "solana-devnet" | "devnet" | "localnet" | "solana:devnet" => Some("devnet"),
+        "solana-testnet" | "testnet" | "solana:testnet" => Some("testnet"),
         SOLANA_MAINNET => Some("mainnet-beta"),
         SOLANA_DEVNET => Some("devnet"),
         SOLANA_TESTNET => Some("testnet"),
-        _ if network.starts_with("solana:") => Some("mainnet-beta"),
         _ => None,
     }
 }
@@ -264,6 +269,15 @@ pub struct PaymentRequirements {
 }
 
 impl PaymentRequirements {
+    /// False when the offer declares a scheme other than `exact`. The exact
+    /// signing path must never sign an offer made under another scheme.
+    pub(crate) fn is_exact_scheme(&self) -> bool {
+        self.accepted
+            .as_ref()
+            .and_then(|value| value.get("scheme"))
+            .is_none_or(|scheme| scheme.as_str() == Some(EXACT_SCHEME))
+    }
+
     /// Canonical v2 accepted object for the selected SVM exact requirement.
     pub fn to_accepted_value(&self) -> serde_json::Value {
         if let Some(accepted) = &self.accepted {
@@ -276,7 +290,7 @@ impl PaymentRequirements {
             "amount": self.amount.clone(),
             "asset": self.currency.clone(),
             "payTo": self.recipient.clone(),
-            "maxTimeoutSeconds": self.max_age.unwrap_or(300),
+            "maxTimeoutSeconds": self.max_age.unwrap_or(DEFAULT_MAX_TIMEOUT_SECONDS),
             "extra": self.canonical_extra_value(),
         })
     }
@@ -352,8 +366,10 @@ impl<'de> Deserialize<'de> for PaymentRequirements {
             .as_object()
             .ok_or_else(|| serde::de::Error::custom("payment requirement must be an object"))?;
 
-        let raw_network =
-            string_field(object, "network").unwrap_or_else(|| SOLANA_NETWORK.to_string());
+        // Never default the ledger: an offer that omits `network` would
+        // otherwise be signed as a mainnet payment nobody named.
+        let raw_network = string_field(object, "network")
+            .ok_or_else(|| serde::de::Error::custom("payment requirement is missing network"))?;
         let network = normalize_network_identifier(&raw_network);
         let cluster = string_field(object, "cluster").or_else(|| {
             cluster_for_caip2_network(&network).map(|cluster| {
@@ -368,24 +384,22 @@ impl<'de> Deserialize<'de> for PaymentRequirements {
         let extra = object.get("extra").cloned();
         let extra_object = extra.as_ref().and_then(|value| value.as_object());
 
-        let recipient = string_field(object, "recipient")
-            .or_else(|| string_field(object, "payTo"))
-            .unwrap_or_default();
+        // RULINGS X1: each term is read from its x402 field only. `amount`
+        // falls back to the v1 `maxAmountRequired` a legacy offer uses; fields
+        // a server adds beside them (`recipient`, `currency`, top-level
+        // `decimals`, `tokenProgram`, `recentBlockhash`, `feePayerKey`) are
+        // ignored, so the signed transfer pays what the echoed `accepted` names.
+        let recipient = string_field(object, "payTo").unwrap_or_default();
         let amount = string_field(object, "amount")
             .or_else(|| string_field(object, "maxAmountRequired"))
             .unwrap_or_default();
-        let currency = string_field(object, "currency")
-            .or_else(|| string_field(object, "asset"))
-            .unwrap_or_else(|| "SOL".to_string());
+        let currency = string_field(object, "asset").unwrap_or_else(|| "SOL".to_string());
 
-        let decimals = u8_field(object, "decimals")
-            .or_else(|| extra_object.and_then(|extra| u8_field(extra, "decimals")));
-        let token_program = string_field(object, "tokenProgram")
-            .or_else(|| extra_object.and_then(|extra| string_field(extra, "tokenProgram")));
-        let recent_blockhash = string_field(object, "recentBlockhash")
-            .or_else(|| extra_object.and_then(|extra| string_field(extra, "recentBlockhash")));
-        let fee_payer_key = string_field(object, "feePayerKey")
-            .or_else(|| extra_object.and_then(|extra| string_field(extra, "feePayer")));
+        let decimals = extra_object.and_then(|extra| u8_field(extra, "decimals"));
+        let token_program = extra_object.and_then(|extra| string_field(extra, "tokenProgram"));
+        let recent_blockhash =
+            extra_object.and_then(|extra| string_field(extra, "recentBlockhash"));
+        let fee_payer_key = extra_object.and_then(|extra| string_field(extra, "feePayer"));
         let fee_payer =
             bool_field(object, "feePayer").or_else(|| fee_payer_key.as_ref().map(|_| true));
         let transaction_versions = extra_object
@@ -397,11 +411,17 @@ impl<'de> Deserialize<'de> for PaymentRequirements {
             })
             .transpose()?;
         let max_age =
-            u64_field(object, "maxAge").or_else(|| u64_field(object, "maxTimeoutSeconds"));
+            u64_field(object, "maxTimeoutSeconds").or_else(|| u64_field(object, "maxAge"));
 
-        let accepted = if object.contains_key("amount")
-            && object.contains_key("asset")
-            && object.contains_key("payTo")
+        // Keep the wire object for canonical v2 offers, and for any offer that
+        // declares another scheme so it is never re-serialized as `exact`.
+        let declares_other_scheme = object
+            .get("scheme")
+            .is_some_and(|scheme| scheme.as_str() != Some(EXACT_SCHEME));
+        let accepted = if declares_other_scheme
+            || (object.contains_key("amount")
+                && object.contains_key("asset")
+                && object.contains_key("payTo"))
         {
             Some(value.clone())
         } else {
@@ -610,6 +630,84 @@ impl PaymentExtensions {
     }
 }
 
+/// The `payment-identifier` extension key.
+pub const PAYMENT_IDENTIFIER_EXTENSION: &str = "payment-identifier";
+
+/// A `payment-identifier` id that satisfies the extension's format: 16-128
+/// characters of `[A-Za-z0-9_-]`. The only constructor is [`Self::parse`], so
+/// holding one proves the id was checked.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PaymentIdentifierId(String);
+
+impl PaymentIdentifierId {
+    /// Shortest id the extension allows.
+    pub const MIN_LEN: usize = 16;
+    /// Longest id the extension allows.
+    pub const MAX_LEN: usize = 128;
+
+    /// Validate `id` against the extension's length and character rules.
+    pub fn parse(id: &str) -> Result<Self, crate::x402::Error> {
+        if !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(crate::x402::Error::PaymentIdentifierRequired(
+                "payment-identifier id may only contain A-Z, a-z, 0-9, '_' and '-'".into(),
+            ));
+        }
+        // ASCII only from here, so the byte length is the character count.
+        if !(Self::MIN_LEN..=Self::MAX_LEN).contains(&id.len()) {
+            return Err(crate::x402::Error::PaymentIdentifierRequired(format!(
+                "payment-identifier id must be {}-{} characters, got {}",
+                Self::MIN_LEN,
+                Self::MAX_LEN,
+                id.len()
+            )));
+        }
+        Ok(Self(id.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PaymentIdentifierId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The `payment-identifier` entry a server advertises in `PaymentRequired`
+/// `extensions`: `info.required` plus the extension's JSON schema.
+pub fn payment_identifier_advertisement(required: bool) -> serde_json::Value {
+    serde_json::json!({
+        "info": { "required": required },
+        "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "required": { "type": "boolean" },
+                "id": { "type": "string", "minLength": 16, "maxLength": 128 }
+            },
+            "required": ["required"]
+        }
+    })
+}
+
+impl PaymentSignatureEnvelope {
+    /// The client's `extensions["payment-identifier"].info.id`, if any.
+    pub fn payment_identifier_id(&self) -> Option<&str> {
+        self.extensions
+            .as_ref()?
+            .payment_identifier
+            .as_ref()?
+            .info
+            .id
+            .as_deref()
+    }
+}
+
 /// Generate a fresh `pay_`-prefixed idempotency id (32 hex chars after
 /// the prefix; 36 total). Satisfies the `payment-identifier` spec
 /// pattern `^[A-Za-z0-9_-]{16,128}$` and the canonical Solana
@@ -767,10 +865,18 @@ mod tests {
         );
         assert_eq!(cluster_for_caip2_network(SOLANA_DEVNET), Some("devnet"));
         assert_eq!(
-            cluster_for_caip2_network("solana:custom-cluster-id"),
+            cluster_for_caip2_network("solana:mainnet"),
             Some("mainnet-beta")
         );
-        assert_eq!(cluster_for_caip2_network("foo:bar"), None);
+        for unknown in [
+            "solana:custom-cluster-id",
+            "solana:",
+            "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvd",
+            "solana:5EYKT4USFV8P8NJDTREPY1VZQKQZKVDP",
+            "foo:bar",
+        ] {
+            assert_eq!(cluster_for_caip2_network(unknown), None, "{unknown}");
+        }
     }
 
     #[test]
@@ -1176,5 +1282,137 @@ mod tests {
         let ext = PaymentExtensions::default().with_payment_identifier_id("pay_aaaaaaaaaaaaaaaa");
         let s = serde_json::to_string(&ext).unwrap();
         assert!(s.contains("\"payment-identifier\""), "got {s}");
+    }
+
+    fn legacy_offer(scheme: Option<serde_json::Value>) -> PaymentRequirements {
+        let mut offer = serde_json::json!({
+            "network": SOLANA_MAINNET,
+            "maxAmountRequired": "1000",
+            "resource": "https://api.example.test/r",
+            "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+            "asset": mints::USDC_MAINNET,
+            "maxTimeoutSeconds": 60
+        });
+        if let Some(scheme) = scheme {
+            offer["scheme"] = scheme;
+        }
+        serde_json::from_value(offer).unwrap()
+    }
+
+    #[test]
+    fn legacy_offer_keeps_a_non_exact_scheme() {
+        for scheme in [
+            serde_json::json!("upto"),
+            serde_json::json!("batch-settlement"),
+            serde_json::json!("Exact"),
+            serde_json::json!(null),
+            serde_json::json!(1),
+        ] {
+            let requirement = legacy_offer(Some(scheme.clone()));
+            assert!(!requirement.is_exact_scheme(), "{scheme}");
+            assert_eq!(requirement.to_accepted_value()["scheme"], scheme);
+        }
+    }
+
+    #[test]
+    fn legacy_exact_offer_is_still_exact() {
+        for scheme in [None, Some(serde_json::json!(EXACT_SCHEME))] {
+            let requirement = legacy_offer(scheme);
+            assert!(requirement.is_exact_scheme());
+            assert!(requirement.accepted.is_none());
+            assert_eq!(requirement.amount, "1000");
+            assert_eq!(requirement.to_accepted_value()["scheme"], EXACT_SCHEME);
+        }
+    }
+
+    fn v2_offer() -> serde_json::Value {
+        serde_json::json!({
+            "scheme": "exact",
+            "network": SOLANA_MAINNET,
+            "amount": "1000",
+            "asset": mints::USDC_MAINNET,
+            "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+            "maxTimeoutSeconds": 300,
+            "extra": {
+                "decimals": 6,
+                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "recentBlockhash": "11111111111111111111111111111111",
+                "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+            }
+        })
+    }
+
+    #[test]
+    fn disagreeing_legacy_aliases_never_replace_x402_fields() {
+        let other = "11111111111111111111111111111112";
+        for (key, value) in [
+            ("recipient", serde_json::json!(other)),
+            ("currency", serde_json::json!("USDT")),
+            ("maxAmountRequired", serde_json::json!("999999")),
+            (
+                "tokenProgram",
+                serde_json::json!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"),
+            ),
+            ("recentBlockhash", serde_json::json!(other)),
+            ("feePayerKey", serde_json::json!(other)),
+            ("decimals", serde_json::json!(9)),
+            ("maxAge", serde_json::json!(60)),
+        ] {
+            let mut offer = v2_offer();
+            offer[key] = value;
+            let requirement: PaymentRequirements = serde_json::from_value(offer).unwrap();
+            let canonical = v2_offer();
+            assert_eq!(requirement.recipient, canonical["payTo"], "{key}");
+            assert_eq!(requirement.currency, canonical["asset"], "{key}");
+            assert_eq!(requirement.amount, "1000", "{key}");
+            assert_eq!(requirement.max_age, Some(300), "{key}");
+            assert_eq!(requirement.decimals, Some(6), "{key}");
+            assert_eq!(
+                requirement.token_program.as_deref(),
+                canonical["extra"]["tokenProgram"].as_str(),
+                "{key}"
+            );
+            assert_eq!(
+                requirement.recent_blockhash.as_deref(),
+                canonical["extra"]["recentBlockhash"].as_str(),
+                "{key}"
+            );
+            assert_eq!(
+                requirement.fee_payer_key.as_deref(),
+                canonical["extra"]["feePayer"].as_str(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_only_terms_are_not_read() {
+        let requirement: PaymentRequirements = serde_json::from_value(serde_json::json!({
+            "scheme": "exact",
+            "network": SOLANA_MAINNET,
+            "amount": "1000",
+            "recipient": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+            "currency": mints::USDC_MAINNET,
+            "decimals": 6,
+            "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "feePayerKey": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+        }))
+        .unwrap();
+        assert_eq!(requirement.recipient, "");
+        assert_eq!(requirement.currency, "SOL");
+        assert_eq!(requirement.decimals, None);
+        assert_eq!(requirement.token_program, None);
+        assert_eq!(requirement.fee_payer_key, None);
+    }
+
+    #[test]
+    fn offer_without_network_is_rejected_instead_of_defaulting_to_mainnet() {
+        let mut offer = v2_offer();
+        offer.as_object_mut().unwrap().remove("network");
+        let error = serde_json::from_value::<PaymentRequirements>(offer).unwrap_err();
+        assert!(error.to_string().contains("missing network"), "{error}");
+
+        let requirement: PaymentRequirements = serde_json::from_value(v2_offer()).unwrap();
+        assert_eq!(requirement.network, SOLANA_MAINNET);
     }
 }

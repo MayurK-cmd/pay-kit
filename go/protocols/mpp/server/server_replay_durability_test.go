@@ -39,14 +39,13 @@ func TestReplayMarkerRetainedOnConfirmationTimeout(t *testing.T) {
 	recipientSigner := testutil.NewPrivateKey()
 	clientSigner := testutil.NewPrivateKey()
 
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient: recipientSigner.PublicKey().String(),
 		Currency:  "sol",
 		Decimals:  9,
 		Network:   "localnet",
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -77,21 +76,15 @@ func TestReplayMarkerRetainedOnConfirmationTimeout(t *testing.T) {
 		t.Fatal("expected the transaction to have been broadcast")
 	}
 
-	// Second attempt with the SAME credential MUST be rejected: the marker
-	// must still be reserved because the original broadcast may land.
+	// Second attempt with the SAME credential MUST NOT re-open the charge:
+	// the marker is still reserved because the original broadcast may land,
+	// so the retry reconciles (status still unknown: in progress) and never
+	// broadcasts again.
 	_, err = verifyCredentialEchoed(handler, context.Background(), credential)
-	if err == nil {
-		t.Fatal("expected re-submission after broadcast+timeout to be rejected as consumed")
+	if code := errCode(t, err); code != core.ErrCodeSettlementInProgress {
+		t.Fatalf("expected settlement-in-progress on re-submission, got: %v", err)
 	}
-	if !isConsumedError(err) {
-		t.Fatalf("expected signature-consumed rejection, got: %v", err)
+	if len(fake.Sent) != 1 {
+		t.Fatalf("re-submission broadcast again: %d sends", len(fake.Sent))
 	}
-}
-
-func isConsumedError(err error) bool {
-	var coreErr *core.Error
-	if errors.As(err, &coreErr) {
-		return coreErr.Code == core.ErrCodeSignatureConsumed
-	}
-	return false
 }

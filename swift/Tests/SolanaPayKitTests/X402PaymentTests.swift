@@ -20,7 +20,7 @@ struct X402ChallengeParsingTests {
                 "amount": "1000",
                 "asset": "\(Mints.usdcDevnet)",
                 "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
-                "extra": {
+                "extra": { "feePayer": "\(x402TestFeePayer)",
                     "recentBlockhash": "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
                     "decimals": 6
                 }
@@ -42,6 +42,7 @@ struct X402ChallengeParsingTests {
         {
             "accepts": [{
                 "scheme": "exact",
+                "extra": {"feePayer": "\(x402TestFeePayer)"},
                 "network": "\(net)",
                 "maxAmountRequired": "5000",
                 "asset": "SOL",
@@ -55,67 +56,14 @@ struct X402ChallengeParsingTests {
         #expect(offer?.asset == "SOL")
     }
 
-    @Test
-    func parsesTopLevelCurrencyShape() throws {
-        // Some x402 servers carry the mint as top-level `currency` with token
-        // metadata at the top level instead of nested under `asset` + `extra`.
-        // The client must resolve them via the `effective*` accessors so it
-        // can pay either wire shape.
-        let net = SolanaNetwork.devnet
-        let body = """
-        {
-            "accepts": [{
-                "scheme": "exact",
-                "network": "\(net)",
-                "amount": "1000",
-                "currency": "\(Mints.usdcDevnet)",
-                "payTo": "abc123",
-                "decimals": 6,
-                "tokenProgram": "\(Mints.tokenProgram)",
-                "recentBlockhash": "11111111111111111111111111111111"
-            }]
-        }
-        """
-        let offer = parseX402Challenge(headers: [], body: body)
-        #expect(offer != nil)
-        #expect(offer?.asset == nil)
-        #expect(offer?.effectiveAsset == Mints.usdcDevnet)
-        #expect(offer?.effectiveDecimals == 6)
-        #expect(offer?.effectiveTokenProgram == Mints.tokenProgram)
-        #expect(offer?.effectiveRecentBlockhash == "11111111111111111111111111111111")
-    }
+    // MARK: - RULINGS X1: only the x402 fields name the terms
 
-    // MARK: - Conflicting-shape precedence (must match Rust types.rs lines 340-349)
-
-    /// When both `currency` (top-level) and `asset` are present, top-level
-    /// `currency` wins. Rust: `string_field(object, "currency").or_else(|| ...)`.
+    /// Fields some servers add beside the x402 ones (`currency`, `recipient`,
+    /// top-level `decimals`, `tokenProgram`, `recentBlockhash`, `feePayerKey`)
+    /// never replace `asset`, `payTo` or `extra.*`, even when they disagree,
+    /// so the signed transfer pays what the echoed `accepted` object names.
     @Test
-    func topLevelCurrencyWinsOverAssetWhenBothPresent() throws {
-        let net = SolanaNetwork.devnet
-        let body = """
-        {
-            "accepts": [{
-                "scheme": "exact",
-                "network": "\(net)",
-                "amount": "1000",
-                "currency": "\(Mints.usdcDevnet)",
-                "asset": "\(Mints.pyusdDevnet)",
-                "payTo": "abc123"
-            }]
-        }
-        """
-        let offer = parseX402Challenge(headers: [], body: body)
-        // Top-level `currency` must win.
-        #expect(offer?.effectiveAsset == Mints.usdcDevnet)
-        // The underlying `asset` field is still accessible directly.
-        #expect(offer?.asset == Mints.pyusdDevnet)
-    }
-
-    /// When both top-level `tokenProgram` and `extra.tokenProgram` are
-    /// present, top-level wins. Rust: `string_field(object, "tokenProgram")
-    /// .or_else(|| extra.and_then(...))`.
-    @Test
-    func topLevelTokenProgramWinsOverExtraTokenProgram() throws {
+    func nonSpecTopLevelFieldsNeverReplaceX402Fields() throws {
         let net = SolanaNetwork.devnet
         let body = """
         {
@@ -124,101 +72,61 @@ struct X402ChallengeParsingTests {
                 "network": "\(net)",
                 "amount": "1000",
                 "asset": "\(Mints.usdcDevnet)",
+                "currency": "\(Mints.pyusdDevnet)",
                 "payTo": "abc123",
+                "recipient": "attacker",
+                "decimals": 9,
                 "tokenProgram": "\(Mints.token2022Program)",
-                "extra": {
+                "recentBlockhash": "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
+                "feePayerKey": "attacker",
+                "extra": { "feePayer": "\(x402TestFeePayer)",
+                    "decimals": 6,
                     "tokenProgram": "\(Mints.tokenProgram)",
                     "recentBlockhash": "11111111111111111111111111111111"
                 }
             }]
         }
         """
-        let offer = parseX402Challenge(headers: [], body: body)
-        // Top-level wins.
-        #expect(offer?.effectiveTokenProgram == Mints.token2022Program)
+        let offer = try #require(parseX402Challenge(headers: [], body: body))
+        #expect(offer.effectiveAsset == Mints.usdcDevnet)
+        #expect(offer.effectivePayTo == "abc123")
+        #expect(offer.effectiveDecimals == 6)
+        #expect(offer.effectiveTokenProgram == Mints.tokenProgram)
+        #expect(offer.effectiveRecentBlockhash == "11111111111111111111111111111111")
+        #expect(offer.effectiveFeePayerKey == x402TestFeePayer)
     }
 
-    /// When both top-level `decimals` and `extra.decimals` are present,
-    /// top-level wins.
+    /// An offer naming its mint and metadata only at the top level carries no
+    /// x402 `asset` or `extra.*` terms.
     @Test
-    func topLevelDecimalsWinOverExtraDecimals() throws {
-        let net = SolanaNetwork.devnet
-        let body = """
-        {
-            "accepts": [{
-                "scheme": "exact",
-                "network": "\(net)",
-                "amount": "1000",
-                "asset": "\(Mints.usdcDevnet)",
-                "payTo": "abc123",
-                "decimals": 9,
-                "extra": {
-                    "decimals": 6,
-                    "recentBlockhash": "11111111111111111111111111111111"
-                }
-            }]
-        }
-        """
-        let offer = parseX402Challenge(headers: [], body: body)
-        // Top-level 9 wins over extra 6.
-        #expect(offer?.effectiveDecimals == 9)
-    }
-
-    /// When both top-level `recentBlockhash` and `extra.recentBlockhash` are
-    /// present, top-level wins.
-    @Test
-    func topLevelRecentBlockhashWinsOverExtraBlockhash() throws {
-        let net = SolanaNetwork.devnet
-        let topHash = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
-        let extraHash = "11111111111111111111111111111111"
-        let body = """
-        {
-            "accepts": [{
-                "scheme": "exact",
-                "network": "\(net)",
-                "amount": "1000",
-                "asset": "\(Mints.usdcDevnet)",
-                "payTo": "abc123",
-                "recentBlockhash": "\(topHash)",
-                "extra": {
-                    "recentBlockhash": "\(extraHash)"
-                }
-            }]
-        }
-        """
-        let offer = parseX402Challenge(headers: [], body: body)
-        // Top-level wins.
-        #expect(offer?.effectiveRecentBlockhash == topHash)
-    }
-
-    /// When only `asset` is present (no `currency`), `effectiveAsset` returns
-    /// `asset` (unchanged behavior for the common case).
-    @Test
-    func assetUsedWhenNoCurrencyPresent() throws {
-        let net = SolanaNetwork.devnet
-        let body = """
-        {
-            "accepts": [{
-                "scheme": "exact",
-                "network": "\(net)",
-                "amount": "1000",
-                "asset": "\(Mints.usdcDevnet)",
-                "payTo": "abc123"
-            }]
-        }
-        """
-        let offer = parseX402Challenge(headers: [], body: body)
-        #expect(offer?.effectiveAsset == Mints.usdcDevnet)
-        #expect(offer?.currency == nil)
+    func topLevelOnlyTermsAreNotRead() throws {
+        let entry = X402AcceptsEntry(
+            scheme: "exact",
+            network: "\(SolanaNetwork.devnet)",
+            amount: "1000",
+            maxAmountRequired: nil,
+            asset: nil,
+            payTo: "abc123",
+            recipient: nil,
+            extra: nil,
+            currency: Mints.usdcDevnet,
+            decimals: 6,
+            tokenProgram: Mints.tokenProgram,
+            recentBlockhash: "11111111111111111111111111111111"
+        )
+        #expect(entry.effectiveAsset == nil)
+        #expect(entry.effectiveDecimals == nil)
+        #expect(entry.effectiveTokenProgram == nil)
+        #expect(entry.effectiveRecentBlockhash == nil)
     }
 
     @Test
     func prefersHeaderOverBody() throws {
         let net = SolanaNetwork.devnet
-        let headerEnvelope = "{\"accepts\": [{\"scheme\": \"exact\",\"network\": \"\(net)\",\"amount\": \"100\",\"asset\": \"SOL\",\"payTo\": \"from-header\"}]}"
+        let headerEnvelope = "{\"accepts\": [{\"scheme\": \"exact\",\"network\": \"\(net)\",\"amount\": \"100\",\"asset\": \"SOL\",\"payTo\": \"from-header\", \"extra\": {\"feePayer\": \"\(x402TestFeePayer)\"}}]}"
         let encoded = Data(headerEnvelope.utf8).base64EncodedString()
         let headers = [(name: "payment-required", value: encoded)]
-        let body = "{\"accepts\": [{\"scheme\": \"exact\",\"network\": \"\(net)\",\"amount\": \"999\",\"asset\": \"SOL\",\"payTo\": \"from-body\"}]}"
+        let body = "{\"accepts\": [{\"scheme\": \"exact\",\"network\": \"\(net)\",\"amount\": \"999\",\"asset\": \"SOL\",\"payTo\": \"from-body\", \"extra\": {\"feePayer\": \"\(x402TestFeePayer)\"}}]}"
         let offer = parseX402Challenge(headers: headers, body: body)
         #expect(offer?.effectivePayTo == "from-header")
         #expect(offer?.effectiveAmount == "100")
@@ -227,6 +135,38 @@ struct X402ChallengeParsingTests {
     @Test
     func returnsNilWhenNoSolanaOffer() {
         let body = "{\"accepts\": [{\"network\": \"ethereum:1\", \"amount\": \"100\"}]}"
+        #expect(parseX402Challenge(headers: [], body: body) == nil)
+    }
+
+    // MARK: - extra.feePayer is required (RULINGS S1)
+
+    /// Regression: an offer without `extra.feePayer` used to be selectable
+    /// (and then signed with the client as fee payer). It is skipped, so the
+    /// conforming sibling wins even though it is more expensive.
+    @Test
+    func skipsOfferWithoutFeePayer() {
+        let net = SolanaNetwork.devnet
+        let body = """
+        {
+            "accepts": [
+                {"scheme":"exact","network":"\(net)","amount":"10","asset":"SOL","payTo":"no-fee-payer"},
+                {"scheme":"exact","network":"\(net)","amount":"20","asset":"SOL","payTo":"bad-fee-payer","extra":{"feePayer":"not-a-pubkey"}},
+                {"extra":{"feePayer":"\(x402TestFeePayer)"},"scheme":"exact","network":"\(net)","amount":"5000","asset":"SOL","payTo":"conforming"}
+            ]
+        }
+        """
+        let offer = parseX402Challenge(headers: [], body: body)
+        #expect(offer?.effectivePayTo == "conforming")
+    }
+
+    /// Regression: when the only offer lacks `extra.feePayer`, nothing is
+    /// payable.
+    @Test
+    func returnsNilWhenOnlyOfferLacksFeePayer() {
+        let net = SolanaNetwork.devnet
+        let body = """
+        {"accepts": [{"scheme":"exact","network":"\(net)","amount":"10","asset":"SOL","payTo":"x","feePayerKey":"\(x402TestFeePayer)"}]}
+        """
         #expect(parseX402Challenge(headers: [], body: body) == nil)
     }
 
@@ -244,8 +184,8 @@ struct X402ChallengeParsingTests {
         let body = """
         {
             "accepts": [
-                {"scheme":"exact","network":"\(net)","amount":"1000000","asset":"\(Mints.usdcDevnet)","payTo":"x"},
-                {"scheme":"exact","network":"\(net)","amount":"1000000","asset":"\(Mints.pyusdDevnet)","payTo":"x"}
+                {"scheme":"exact","extra": {"feePayer": "\(x402TestFeePayer)"},"network":"\(net)","amount":"1000000","asset":"\(Mints.usdcDevnet)","payTo":"x"},
+                {"scheme":"exact","extra": {"feePayer": "\(x402TestFeePayer)"},"network":"\(net)","amount":"1000000","asset":"\(Mints.pyusdDevnet)","payTo":"x"}
             ]
         }
         """
@@ -260,7 +200,7 @@ struct X402ChallengeParsingTests {
         let body = """
         {
             "accepts": [
-                {"scheme":"exact","network":"\(net)","amount":"1000000","asset":"\(Mints.usdcDevnet)","payTo":"x"}
+                {"scheme":"exact","extra": {"feePayer": "\(x402TestFeePayer)"},"network":"\(net)","amount":"1000000","asset":"\(Mints.usdcDevnet)","payTo":"x"}
             ]
         }
         """
@@ -275,7 +215,7 @@ struct X402ChallengeParsingTests {
         let body = """
         {
             "accepts": [
-                {"scheme":"exact","network":"\(net)","amount":"1000","asset":"SOL","payTo":"x"}
+                {"scheme":"exact","extra": {"feePayer": "\(x402TestFeePayer)"},"network":"\(net)","amount":"1000","asset":"SOL","payTo":"x"}
             ]
         }
         """
@@ -290,8 +230,8 @@ struct X402ChallengeParsingTests {
         let body = """
         {
             "accepts": [
-                {"scheme":"exact","network":"\(net)","amount":"1000000","asset":"\(Mints.usdcDevnet)","payTo":"x"},
-                {"scheme":"exact","network":"\(net)","amount":"5000","asset":"SOL","payTo":"x"}
+                {"scheme":"exact","extra": {"feePayer": "\(x402TestFeePayer)"},"network":"\(net)","amount":"1000000","asset":"\(Mints.usdcDevnet)","payTo":"x"},
+                {"scheme":"exact","extra": {"feePayer": "\(x402TestFeePayer)"},"network":"\(net)","amount":"5000","asset":"SOL","payTo":"x"}
             ]
         }
         """
@@ -306,7 +246,7 @@ struct X402ChallengeParsingTests {
         let body = """
         {
             "accepts": [
-                {"scheme":"exact","network":"\(net)","amount":"1000000","asset":"\(Mints.usdcDevnet)","payTo":"x"}
+                {"scheme":"exact","extra": {"feePayer": "\(x402TestFeePayer)"},"network":"\(net)","amount":"1000000","asset":"\(Mints.usdcDevnet)","payTo":"x"}
             ]
         }
         """
@@ -325,13 +265,14 @@ struct X402PaymentBuildingTests {
     }
 
     static func makeRpc() -> RpcClient {
-        RpcClient(endpoint: URL(string: "http://localhost:8899")!)
+        MintFixtureURLProtocol.rpc()
     }
 
     static let knownBlockhash = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
 
     static func solOffer() -> X402AcceptsEntry {
-        let extra: [String: JSONValue] = ["recentBlockhash": .string(knownBlockhash)]
+        let extra: [String: JSONValue] = [
+            "feePayer": .string(x402TestFeePayer),"recentBlockhash": .string(knownBlockhash)]
         return X402AcceptsEntry(
             scheme: "exact",
             network: SolanaNetwork.devnet,
@@ -346,6 +287,7 @@ struct X402PaymentBuildingTests {
 
     static func splOffer() -> X402AcceptsEntry {
         let extra: [String: JSONValue] = [
+            "feePayer": .string(x402TestFeePayer),
             "recentBlockhash": .string(knownBlockhash),
             "tokenProgram": .string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
             "decimals": .int(6),
@@ -361,6 +303,32 @@ struct X402PaymentBuildingTests {
             recipient: nil,
             extra: extra
         )
+    }
+
+    /// The credential names the resource it pays for: the challenge's
+    /// `resource` is echoed in the v2 envelope, and an offer built in code
+    /// carries none.
+    @Test
+    func echoesTheChallengeResource() async throws {
+        let signer = try Self.makeSigner()
+        let rpc = Self.makeRpc()
+        let offer = try JSONEncoder().encode(Self.solOffer())
+        let challenge = #"{"x402Version":2,"resource":{"url":"/protected","description":"report"},"accepts":["#
+            + String(decoding: offer, as: UTF8.self) + "]}"
+        let parsed = try #require(parseX402Challenge(
+            headers: [(name: "payment-required", value: Data(challenge.utf8).base64EncodedString())],
+            body: nil,
+            selection: X402ChallengeSelection(network: SolanaNetwork.devnet)
+        ))
+        func resource(_ header: String) throws -> [String: Any]? {
+            let data = try #require(Data(base64Encoded: header))
+            let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            return object["resource"] as? [String: Any]
+        }
+        let echoed = try resource(try await buildX402PaymentHeader(signer: signer, rpc: rpc, offer: parsed))
+        #expect(echoed?["url"] as? String == "/protected")
+        #expect(echoed?["description"] as? String == "report")
+        #expect(try resource(try await buildX402PaymentHeader(signer: signer, rpc: rpc, offer: Self.solOffer())) == nil)
     }
 
     @Test
@@ -381,11 +349,11 @@ struct X402PaymentBuildingTests {
             Issue.record("payload.transaction is not valid base64")
             return
         }
-        // v0 transaction: first byte is 0x01 (1 sig slot), then 64-byte sig,
+        // v0 transaction: 2 signature slots (facilitator fee payer + signer),
         // then 0x80 (v0 message prefix).
         #expect(txData.count > 65)
-        #expect(txData[0] == 0x01)
-        #expect(txData[1 + 64] == 0x80)
+        #expect(txData[0] == 0x02)
+        #expect(txData[1 + 128] == 0x80)
     }
 
     @Test
@@ -419,7 +387,7 @@ struct X402PaymentBuildingTests {
             "asset": "\(Mints.usdcDevnet)",
             "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
             "maxTimeoutSeconds": 60,
-            "extra": {
+            "extra": { "feePayer": "\(x402TestFeePayer)",
               "recentBlockhash": "\(Self.knownBlockhash)",
               "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
               "decimals": 6
@@ -473,6 +441,7 @@ struct X402PaymentBuildingTests {
     @Test
     func inCodeEntryTypedFallbackPreservesExplicitMaxTimeoutSeconds() async throws {
         let extra: [String: JSONValue] = [
+            "feePayer": .string(x402TestFeePayer),
             "recentBlockhash": .string(Self.knownBlockhash),
         ]
         let offer = X402AcceptsEntry(

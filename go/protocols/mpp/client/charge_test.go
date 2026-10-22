@@ -132,6 +132,50 @@ func TestBuildChargeTransactionWithFeePayer(t *testing.T) {
 	}
 }
 
+func TestBuildChargeTransactionRefusesSignerAsSponsorFeePayer(t *testing.T) {
+	rpcClient := testutil.NewFakeRPC()
+	signer := testutil.NewPrivateKey()
+	recipient := testutil.NewPrivateKey().PublicKey().String()
+	mint := testutil.NewPrivateKey().PublicKey()
+	rpcClient.MintOwners[mint.String()] = solana.TokenProgramID
+	decimals := uint8(6)
+	enabled := true
+	split := testutil.NewPrivateKey().PublicKey().String()
+	details := func(feePayerKey string, splits []paycore.Split) paycore.MethodDetails {
+		return paycore.MethodDetails{
+			Decimals:    &decimals,
+			FeePayer:    &enabled,
+			FeePayerKey: feePayerKey,
+			Splits:      splits,
+		}
+	}
+	required := true
+	ataSplit := []paycore.Split{{Recipient: split, Amount: "100", AtaCreationRequired: &required}}
+
+	for _, splits := range [][]paycore.Split{nil, ataSplit} {
+		_, err := BuildChargeTransaction(context.Background(), signer, rpcClient, "1000", mint.String(), recipient,
+			details(signer.PublicKey().String(), splits), BuildOptions{})
+		if err == nil || !strings.Contains(err.Error(), "feePayerKey names the signer") {
+			t.Fatalf("splits=%v: err = %v, want signer-as-fee-payer refusal", splits, err)
+		}
+		sponsor := testutil.NewPrivateKey().PublicKey()
+		payload, err := BuildChargeTransaction(context.Background(), signer, rpcClient, "1000", mint.String(), recipient,
+			details(sponsor.String(), splits), BuildOptions{})
+		if err != nil {
+			t.Fatalf("splits=%v: separate sponsor rejected: %v", splits, err)
+		}
+		tx, err := solanatx.DecodeTransactionBase64(payload.Transaction)
+		if err != nil || tx.Message.AccountKeys[0] != sponsor {
+			t.Fatalf("splits=%v: fee payer = %v (%v), want the sponsor", splits, tx, err)
+		}
+	}
+	_, err := BuildChargeTransaction(context.Background(), signer, rpcClient, "1000", "sol", recipient,
+		paycore.MethodDetails{FeePayer: &enabled, FeePayerKey: signer.PublicKey().String()}, BuildOptions{})
+	if err == nil || !strings.Contains(err.Error(), "feePayerKey names the signer") {
+		t.Fatalf("sol: err = %v, want signer-as-fee-payer refusal", err)
+	}
+}
+
 func TestBuildChargeTransactionTokenPull(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	signer := testutil.NewPrivateKey()
@@ -155,44 +199,54 @@ func TestBuildChargeTransactionTokenPull(t *testing.T) {
 	}
 }
 
-// TestBuildChargeTransactionTokenCreateRecipientATAFlag table-tests the
-// opt-in CreateRecipientATA flag. The default (false) leaves
-// primary-recipient ATA creation to the server, as the other SDK clients
-// do, while setting the flag prepends an idempotent
-// createAssociatedTokenAccount instruction for first-run wallets that
-// do not yet hold a token account for the selected mint.
-func TestBuildChargeTransactionTokenCreateRecipientATAFlag(t *testing.T) {
+// TestBuildChargeTransactionNeverCreatesPrimaryRecipientATA pins
+// draft-solana-charge-00: clients "MUST NOT include ATA creation
+// instructions for the top-level recipient". The positive control is the
+// split flagged ataCreationRequired, which MUST get exactly one.
+func TestBuildChargeTransactionNeverCreatesPrimaryRecipientATA(t *testing.T) {
 	mint := testutil.NewPrivateKey().PublicKey()
-	cases := []struct {
-		name             string
-		createRecipient  bool
-		wantInstructions int
-	}{
-		{name: "default_skips_primary_ata", createRecipient: false, wantInstructions: 3},
-		{name: "opt_in_adds_primary_ata", createRecipient: true, wantInstructions: 4},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			rpcClient := testutil.NewFakeRPC()
-			rpcClient.MintOwners[mint.String()] = solana.TokenProgramID
-			signer := testutil.NewPrivateKey()
-			recipient := testutil.NewPrivateKey().PublicKey().String()
-			decimals := uint8(6)
+	rpcClient := testutil.NewFakeRPC()
+	rpcClient.MintOwners[mint.String()] = solana.TokenProgramID
+	signer := testutil.NewPrivateKey()
+	recipient := testutil.NewPrivateKey().PublicKey()
+	splitRecipient := testutil.NewPrivateKey().PublicKey()
+	decimals := uint8(6)
+	required := true
 
-			payload, err := BuildChargeTransaction(context.Background(), signer, rpcClient, "1000", mint.String(), recipient, paycore.MethodDetails{
-				Decimals: &decimals,
-			}, BuildOptions{CreateRecipientATA: tc.createRecipient})
-			if err != nil {
-				t.Fatalf("build failed: %v", err)
+	countATACreates := func(t *testing.T, details paycore.MethodDetails) map[string]int {
+		t.Helper()
+		payload, err := BuildChargeTransaction(context.Background(), signer, rpcClient, "1000", mint.String(), recipient.String(), details, BuildOptions{})
+		if err != nil {
+			t.Fatalf("build failed: %v", err)
+		}
+		tx, err := solanatx.DecodeTransactionBase64(payload.Transaction)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		owners := map[string]int{}
+		keys := tx.Message.AccountKeys
+		for _, ix := range tx.Message.Instructions {
+			if keys[ix.ProgramIDIndex].String() != paycore.AssociatedTokenProgram {
+				continue
 			}
-			tx, err := solanatx.DecodeTransactionBase64(payload.Transaction)
-			if err != nil {
-				t.Fatalf("decode failed: %v", err)
-			}
-			if len(tx.Message.Instructions) != tc.wantInstructions {
-				t.Fatalf("instructions = %d, want %d", len(tx.Message.Instructions), tc.wantInstructions)
-			}
-		})
+			// createAssociatedTokenAccount accounts: payer, ata, owner, mint, ...
+			owners[keys[ix.Accounts[2]].String()]++
+		}
+		return owners
+	}
+
+	if owners := countATACreates(t, paycore.MethodDetails{Decimals: &decimals}); len(owners) != 0 {
+		t.Fatalf("no-split charge created ATAs for %v, want none", owners)
+	}
+	owners := countATACreates(t, paycore.MethodDetails{
+		Decimals: &decimals,
+		Splits:   []paycore.Split{{Recipient: splitRecipient.String(), Amount: "100", AtaCreationRequired: &required}},
+	})
+	if owners[recipient.String()] != 0 {
+		t.Fatalf("created an ATA for the top-level recipient: %v", owners)
+	}
+	if owners[splitRecipient.String()] != 1 || len(owners) != 1 {
+		t.Fatalf("ATA creates = %v, want exactly one for the ataCreationRequired split", owners)
 	}
 }
 

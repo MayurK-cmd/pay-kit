@@ -5,6 +5,9 @@ dist/
 .env
 *.tsbuildinfo
 
+# Pinned, locally built unpublished Python Codama renderer.
+/.codama-renderers-python/
+
 # Coverage
 coverage/
 *.lcov
@@ -42,3 +45,6 @@ rust/target/doc-json/
 *.xcuserstate
 *.xcuserstate
 coverage.out
+
+# Conformance run outputs (harness/src/expectations-run.ts)
+harness/results/

@@ -95,6 +95,8 @@ pub enum TxPipelineError {
     },
     #[error("transaction {signature} did not reach confirmed commitment before timeout")]
     ConfirmationTimeout { signature: Signature },
+    #[error("transaction {signature} did not reach finalized commitment before timeout")]
+    FinalizationTimeout { signature: Signature },
     #[error("RPC submission and confirmation failed for transaction {signature}")]
     SubmissionFailed { signature: Signature },
     #[error("transaction submission guard rejected the attempt")]
@@ -107,6 +109,8 @@ pub enum TxPipelineError {
     BlockhashReadFailed,
     #[error("RPC returned malformed account data for {address}")]
     AccountDecodeFailed { address: Pubkey },
+    #[error("account {address} is not owned by the expected program")]
+    AccountOwnerMismatch { address: Pubkey },
     #[error("transaction pipeline stopped unexpectedly")]
     Stopped,
 }
@@ -144,6 +148,7 @@ struct PendingConfirmation {
 struct AccountReadRequest {
     address: Pubkey,
     min_context_slot: Option<u64>,
+    expected_owner: Option<Pubkey>,
     response: oneshot::Sender<PipelineResult<Option<Vec<u8>>>>,
 }
 
@@ -331,6 +336,78 @@ impl TxPipeline {
         response_rx.await.map_err(|_| TxPipelineError::Stopped)?
     }
 
+    /// Await finalized commitment for a signature, polling its status directly.
+    /// A transaction that fails on-chain or never finalizes is an error.
+    pub async fn confirm_finalized(
+        &self,
+        signature: Signature,
+    ) -> PipelineResult<ConfirmedTransaction> {
+        let deadline = Instant::now() + self.inner.config.confirmation_timeout;
+        loop {
+            if let Ok(statuses) = self.inner.rpc.get_signature_statuses(&[signature]).await {
+                if let Some(Some(status)) = statuses.value.into_iter().next() {
+                    if let Some(error) = status.err {
+                        return Err(TxPipelineError::TransactionFailed {
+                            signature,
+                            reason: format!("{error:?}"),
+                        });
+                    }
+                    if status.satisfies_commitment(CommitmentConfig::finalized()) {
+                        return Ok(ConfirmedTransaction {
+                            signature,
+                            slot: status.slot,
+                        });
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(TxPipelineError::FinalizationTimeout { signature });
+            }
+            tokio::time::sleep(self.inner.config.confirmation_poll_interval).await;
+        }
+    }
+
+    /// Read program state at finalized commitment from a bank at or after
+    /// `min_context_slot`. Ownership is checked on the same observation; a
+    /// missing account returns `None`.
+    pub async fn read_finalized_owned_account_data(
+        &self,
+        address: Pubkey,
+        min_context_slot: u64,
+        expected_owner: Pubkey,
+    ) -> PipelineResult<Option<Vec<u8>>> {
+        let response: solana_rpc_client_api::response::Response<
+            Option<solana_account_decoder_client_types::UiAccount>,
+        > = self
+            .inner
+            .rpc
+            .send(
+                RpcRequest::GetAccountInfo,
+                serde_json::json!([
+                    address.to_string(), {
+                        "commitment": "finalized",
+                        "minContextSlot": min_context_slot,
+                        "encoding": "base64",
+                    }
+                ]),
+            )
+            .await
+            .map_err(|_| TxPipelineError::AccountReadFailed)?;
+        if response.context.slot < min_context_slot {
+            return Err(TxPipelineError::AccountReadFailed);
+        }
+        let Some(account) = response.value else {
+            return Ok(None);
+        };
+        let account = account
+            .to_account()
+            .ok_or(TxPipelineError::AccountDecodeFailed { address })?;
+        if account.owner.to_bytes() != expected_owner.to_bytes() {
+            return Err(TxPipelineError::AccountOwnerMismatch { address });
+        }
+        Ok(Some(account.data))
+    }
+
     /// Read one account at confirmed commitment, optionally requiring the RPC
     /// node to have reached the transaction's confirmation slot. Concurrent
     /// callers are coalesced into `getMultipleAccounts` requests.
@@ -339,12 +416,38 @@ impl TxPipeline {
         address: Pubkey,
         min_context_slot: Option<u64>,
     ) -> PipelineResult<Option<Vec<u8>>> {
+        self.queue_account_read(address, min_context_slot, None)
+            .await
+    }
+
+    /// Read program state only when the account belongs to the expected program.
+    ///
+    /// Ownership is checked on the same RPC observation as the returned data;
+    /// a missing account still returns `None`. Reads share the normal batching
+    /// and minimum-context-slot policy.
+    pub async fn read_owned_account_data(
+        &self,
+        address: Pubkey,
+        min_context_slot: Option<u64>,
+        expected_owner: Pubkey,
+    ) -> PipelineResult<Option<Vec<u8>>> {
+        self.queue_account_read(address, min_context_slot, Some(expected_owner))
+            .await
+    }
+
+    async fn queue_account_read(
+        &self,
+        address: Pubkey,
+        min_context_slot: Option<u64>,
+        expected_owner: Option<Pubkey>,
+    ) -> PipelineResult<Option<Vec<u8>>> {
         let (response_tx, response_rx) = oneshot::channel();
         self.inner
             .account_reads
             .send(AccountReadRequest {
                 address,
                 min_context_slot,
+                expected_owner,
                 response: response_tx,
             })
             .map_err(|_| TxPipelineError::Stopped)?;
@@ -455,6 +558,26 @@ impl TxPipeline {
             || matches!(statuses.value.as_slice(), [Some(status)]
                 if status.err.is_some()
                     && status.satisfies_commitment(CommitmentConfig::finalized())))
+    }
+
+    /// Slot at which `signature` landed successfully at confirmed commitment,
+    /// searching transaction history; `None` when it is not observed.
+    pub async fn landed_slot(&self, signature: Signature) -> PipelineResult<Option<u64>> {
+        let statuses = self
+            .inner
+            .rpc
+            .get_signature_statuses_with_history(&[signature])
+            .await
+            .map_err(|_| TxPipelineError::SubmissionFailed { signature })?;
+        Ok(match statuses.value.as_slice() {
+            [Some(status)]
+                if status.err.is_none()
+                    && status.satisfies_commitment(CommitmentConfig::confirmed()) =>
+            {
+                Some(status.slot)
+            }
+            _ => None,
+        })
     }
 
     async fn pace_submission(&self) {
@@ -648,9 +771,18 @@ async fn run_account_reader(
                     let value = match account {
                         Some(account) => account
                             .to_account()
-                            .map(|account| account.data)
                             .ok_or(TxPipelineError::AccountDecodeFailed {
                                 address: request.address,
+                            })
+                            .and_then(|account| {
+                                if request.expected_owner.is_some_and(|owner| {
+                                    owner.to_bytes() != account.owner.to_bytes()
+                                }) {
+                                    return Err(TxPipelineError::AccountOwnerMismatch {
+                                        address: request.address,
+                                    });
+                                }
+                                Ok(account.data)
                             })
                             .map(Some),
                         None => Ok(None),
@@ -1075,6 +1207,61 @@ mod tests {
         assert!(batches.iter().all(|(size, _)| *size <= ACCOUNT_BATCH_LIMIT));
         assert_eq!(batches.len(), 2);
         assert!(batches.iter().all(|(_, min_slot)| min_slot.is_some()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn owned_account_reads_check_each_callers_owner_in_the_same_batch() {
+        let address = Pubkey::new_unique();
+        let missing = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| async move {
+                assert_eq!(request["method"], "getMultipleAccounts");
+                assert_eq!(request["params"][1]["minContextSlot"], 77);
+                let values = request["params"][0]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|key| {
+                        if key.as_str() == Some(missing.to_string().as_str()) {
+                            return Value::Null;
+                        }
+                        json!({
+                            "data": ["AQID", "base64"],
+                            "executable": false,
+                            "lamports": 1,
+                            "owner": owner.to_string(),
+                            "rentEpoch": 0,
+                            "space": 3
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": {"context": {"slot": 77}, "value": values}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pipeline = TxPipeline::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            test_config(),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (valid, invalid, absent) = tokio::join!(
+            pipeline.read_owned_account_data(address, Some(77), owner),
+            pipeline.read_owned_account_data(address, Some(77), Pubkey::new_unique()),
+            pipeline.read_owned_account_data(missing, Some(77), owner),
+        );
+        assert_eq!(valid.unwrap(), Some(vec![1, 2, 3]));
+        assert!(matches!(
+            invalid,
+            Err(TxPipelineError::AccountOwnerMismatch { address: actual }) if actual == address
+        ));
+        assert_eq!(absent.unwrap(), None);
         server.abort();
     }
 

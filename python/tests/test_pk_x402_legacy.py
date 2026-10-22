@@ -20,16 +20,18 @@ import json
 import struct
 
 import pytest
+from solana_keychain import MemorySigner
 from solders.hash import Hash
 from solders.instruction import AccountMeta, Instruction
 from solders.keypair import Keypair
 from solders.message import MessageV0, to_bytes_versioned
 from solders.pubkey import Pubkey
+from solders.signature import Signature
+from solders.transaction import VersionedTransaction
 
 import solana_pay_kit.protocols.x402 as xmod
 from solana_pay_kit import Gate as GateCls
 from solana_pay_kit import (
-    LocalSigner,
     MemoryStore,
     Operator,
     Price,
@@ -123,7 +125,7 @@ def _devnet_offer(amount: str = "1000") -> dict:
 
 @pytest.mark.asyncio
 async def test_legacy_producer_emits_top_level_scheme_and_plain_network():
-    signer = LocalSigner.generate()
+    signer = MemorySigner(Keypair())
     offer = _devnet_offer()
     header = await build_payment_header_legacy(
         signer,
@@ -143,7 +145,7 @@ async def test_legacy_producer_emits_top_level_scheme_and_plain_network():
 
 @pytest.mark.asyncio
 async def test_legacy_producer_maps_mainnet_to_plain_solana():
-    signer = LocalSigner.generate()
+    signer = MemorySigner(Keypair())
     mint_mainnet = resolve("USDC", "mainnet")
     offer = {
         "protocol": "x402",
@@ -251,7 +253,7 @@ def _clean(monkeypatch):
 
 def _devnet_adapter(monkeypatch, signature="SIG-legacy"):
     op_kp = Keypair()
-    op = Operator(signer=LocalSigner.from_keypair(op_kp), recipient=str(Keypair().pubkey()))
+    op = Operator(signer=MemorySigner(op_kp), recipient=str(Keypair().pubkey()))
     cfg = configure(
         network="solana_devnet",
         preflight=False,
@@ -293,12 +295,15 @@ def _legacy_envelope(adapter, gate, op_kp, *, network=SOLANA_DEVNET_NAME, versio
     transfer = Instruction(Pubkey.from_string(TP_DEVNET), data, metas)
     memo = Instruction(Pubkey.from_string(MEMO_PROGRAM), offer["extra"]["memo"].encode(), [])
     msg = MessageV0.try_compile(op_kp.pubkey(), [cl, cp, transfer, memo], [], Hash.from_string(BH))
+    # The v0 wire form a client sends: the transfer authority's slot signed,
+    # the fee payer's slot left as a zero placeholder for the server to co-sign.
     num = int(msg.header.num_required_signatures)
-    wire = bytearray()
-    wire.append(num)
-    wire.extend(bytes(64) * num)
-    wire.extend(bytes(to_bytes_versioned(msg)))
-    tx_b64 = base64.b64encode(bytes(wire)).decode()
+    signed_bytes = bytes(to_bytes_versioned(msg))
+    sigs = [
+        authority.sign_message(signed_bytes) if key == authority.pubkey() else Signature.default()
+        for key in msg.account_keys[:num]
+    ]
+    tx_b64 = base64.b64encode(bytes(VersionedTransaction.populate(msg, sigs))).decode()
     # Legacy envelope: top-level scheme + plain network, NO accepted object.
     envelope: dict = {
         "x402Version": version,

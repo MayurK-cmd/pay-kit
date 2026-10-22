@@ -65,10 +65,15 @@ from solana_pay_kit import (  # noqa: E402
     Signer,
     Stablecoin,
 )
-from solana_pay_kit._paycore.errors import PaymentError, canonical_code  # noqa: E402
+from solana_pay_kit._paycore.errors import (  # noqa: E402
+    CODE_SETTLEMENT_IN_PROGRESS,
+    PaymentError,
+    canonical_code,
+    settlement_in_progress_response,
+)
 from solana_pay_kit._paycore.rpc import SolanaRpc  # noqa: E402
 from solana_pay_kit._paycore.store import MemoryStore  # noqa: E402
-from solana_pay_kit.errors import InvalidProofError  # noqa: E402
+from solana_pay_kit.errors import InvalidProofError, SettlementInProgressError  # noqa: E402
 from solana_pay_kit.protocols.mpp.core.headers import format_www_authenticate, parse_authorization, parse_receipt  # noqa: E402
 from solana_pay_kit.protocols.mpp.intents.charge import ChargeRequest  # noqa: E402
 from solana_pay_kit.protocols.mpp._paymentchannels import PROGRAM_ID as PAYMENT_CHANNELS_PROGRAM_ID  # noqa: E402
@@ -293,7 +298,7 @@ class _Adapter:
         # Pubkey mode: the literal scenario mint pubkey is the MPP currency.
         self.mint = require_env("MPP_HARNESS_MINT")
         amount_units = require_env("MPP_HARNESS_AMOUNT")
-        secret = optional_env("MPP_HARNESS_SECRET_KEY", "mpp-harness-secret-key")
+        secret = optional_env("MPP_HARNESS_SECRET_KEY", "mpp-harness-secret-key-with-32b-pad")
         network_raw = optional_env("MPP_HARNESS_NETWORK", "localnet")
         self.resource_path = optional_env("MPP_HARNESS_RESOURCE_PATH", "/paid")
         self.settlement_header = optional_env("MPP_HARNESS_SETTLEMENT_HEADER", "x-payment-settlement-signature").lower()
@@ -306,9 +311,7 @@ class _Adapter:
         fee_payer = None
         fee_payer_raw = os.environ.get("MPP_HARNESS_FEE_PAYER_SECRET_KEY")
         if fee_payer_raw:
-            from solders.keypair import Keypair
-
-            fee_payer = Keypair.from_bytes(bytes(json.loads(fee_payer_raw)))
+            fee_payer = Signer.json(fee_payer_raw)
         self.fee_payer = fee_payer
 
         # Build the lower-level solana_pay_kit.protocols.mpp handler with the raw mint. The
@@ -361,7 +364,7 @@ class _Adapter:
         # and stamps challenge fields from one blocking getLatestBlockhash
         # call (the slot rides in its context).
         config = SessionConfig(
-            operator=str(signer.pubkey()),
+            operator=str(signer.pubkey),
             recipient=pay_to,
             amount=int(amount_units),
             currency=optional_env("MPP_HARNESS_SESSION_CURRENCY", "USDC"),
@@ -527,6 +530,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
             return
         try:
             payment = asyncio.run(adapter.adapter.verify_and_settle(gate, request))
+        except SettlementInProgressError as err:
+            self._send_settlement_in_progress(str(err))
+            return
         except InvalidProofError as err:
             self._send_json(
                 402,
@@ -631,6 +637,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
 
             receipt = asyncio.run(_verify_with_fresh_rpc())
         except PaymentError as err:
+            if canonical_code(err.code) == CODE_SETTLEMENT_IN_PROGRESS:
+                self._send_settlement_in_progress(str(err))
+                return
             self._issue_mpp_challenge(
                 adapter, amount, options, message=str(err) or "verification failed", code=err.code
             )
@@ -648,6 +657,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 adapter.settlement_header: receipt.reference,
             },
         )
+
+    def _send_settlement_in_progress(self, message: str) -> None:
+        response = settlement_in_progress_response(message)
+        self._send_json(response["status_code"], response["body"], extra_headers=response["headers"])
 
     def _issue_mpp_challenge(
         self,

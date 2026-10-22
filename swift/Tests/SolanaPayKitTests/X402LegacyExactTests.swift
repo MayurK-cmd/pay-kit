@@ -7,10 +7,9 @@ import Testing
 // Swift implements the x402 CLIENT side, so it covers the conformance
 // `build-transaction` mode: parse a legacy 402 challenge, build the legacy
 // `X-PAYMENT` envelope, and keep the canonical `PAYMENT-SIGNATURE` as the
-// default producer. The shared conformance vectors at
-// `harness/vectors/x402-v1-build.json` are driven directly through the swift
-// builder below; the `verify-transaction` vectors are server-side and are
-// out of scope for the client SDK.
+// default producer. The shared conformance vectors
+// (`harness/vectors/x402-v1-*.json`) are judged by `pkc run --sdk swift`
+// against harness/expectations/swift.toml, not by a second copy here.
 //
 // Mirrors rust `build_payment_header_v1` (client/exact/payment.rs:153-170),
 // `v1_network_for_requirements` (payment.rs:393-404), and the default
@@ -22,167 +21,10 @@ private struct LegacyFixtures {
     }
 
     static func makeRpc() -> RpcClient {
-        RpcClient(endpoint: URL(string: "http://localhost:8899")!)
+        MintFixtureURLProtocol.rpc()
     }
 
     static let knownBlockhash = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
-}
-
-// MARK: - Shared conformance vector driver (client build side)
-
-/// Decoded `expect.x402EnvelopeShape` of a build-transaction vector.
-private struct ExpectedEnvelopeShape: Decodable {
-    let x402Version: Int
-    let scheme: String?
-    let network: String?
-    let hasAccepted: Bool
-    let payloadHasTransaction: Bool
-    let acceptedScheme: String?
-    let acceptedNetwork: String?
-    let acceptedAsset: String?
-    let acceptedPayTo: String?
-    let acceptedAmount: String?
-}
-
-private struct BuildVector: Decodable {
-    struct Expect: Decodable {
-        let outcome: String
-        let x402EnvelopeShape: ExpectedEnvelopeShape
-    }
-    struct Input: Decodable {
-        let x402Version: Int?
-        let x402Offer: VectorOffer
-    }
-    struct VectorOffer: Decodable {
-        let scheme: String?
-        let network: String
-        let amount: String?
-        let maxAmountRequired: String?
-        let asset: String?
-        let payTo: String?
-        let maxTimeoutSeconds: Int?
-        let extra: [String: JSONValue]?
-    }
-    let id: String
-    let mode: String
-    let input: Input
-    let expect: Expect
-}
-
-@Suite("x402 legacy exact conformance vectors (build side)")
-struct X402LegacyBuildVectorTests {
-    /// Load the shared build-transaction vectors from the harness corpus so
-    /// the swift client is exercised by the same fixtures as the other SDKs.
-    private static func loadVectors() throws -> [BuildVector] {
-        let here = URL(fileURLWithPath: #filePath)
-        let vectorURL = here
-            .deletingLastPathComponent() // SolanaPayKitTests
-            .deletingLastPathComponent() // Tests
-            .deletingLastPathComponent() // swift
-            .deletingLastPathComponent() // repo root
-            .appendingPathComponent("harness/vectors/x402-v1-build.json")
-        let data = try Data(contentsOf: vectorURL)
-        return try JSONDecoder().decode([BuildVector].self, from: data)
-    }
-
-    @Test
-    func everyBuildVectorMatchesEnvelopeShape() async throws {
-        let vectors = try Self.loadVectors()
-        #expect(vectors.count == 3)
-
-        for vector in vectors {
-            #expect(vector.mode == "build-transaction", "\(vector.id)")
-            #expect(vector.expect.outcome == "accept", "\(vector.id)")
-
-            let v = vector.input.x402Offer
-            let offer = X402AcceptsEntry(
-                scheme: v.scheme,
-                network: v.network,
-                amount: v.amount,
-                maxAmountRequired: v.maxAmountRequired,
-                asset: v.asset,
-                payTo: v.payTo,
-                recipient: nil,
-                extra: _withBlockhash(v.extra),
-                maxTimeoutSeconds: v.maxTimeoutSeconds
-            )
-
-            // Emit the version the vector's challenge declared (nil -> default v2).
-            let payment = try await buildX402PaymentForChallenge(
-                signer: try LegacyFixtures.makeSigner(),
-                rpc: LegacyFixtures.makeRpc(),
-                offer: offer,
-                declaredVersion: vector.input.x402Version,
-                nonceGenerator: { Data(repeating: 0xAB, count: 16) }
-            )
-
-            // Header name follows the declared version.
-            let expectedHeader = vector.input.x402Version == X402VersionLegacy
-                ? X402LegacyPaymentHeader
-                : X402PaymentHeader
-            #expect(payment.headerName == expectedHeader, "\(vector.id) header")
-
-            let shape = try _decodeShape(payment.value)
-            let want = vector.expect.x402EnvelopeShape
-
-            #expect(shape["x402Version"] as? Int == want.x402Version, "\(vector.id) version")
-            #expect((shape["accepted"] != nil) == want.hasAccepted, "\(vector.id) hasAccepted")
-
-            let payload = shape["payload"] as? [String: Any]
-            let tx = payload?["transaction"] as? String
-            #expect((tx?.isEmpty == false) == want.payloadHasTransaction, "\(vector.id) tx")
-
-            if let wantScheme = want.scheme {
-                #expect(shape["scheme"] as? String == wantScheme, "\(vector.id) scheme")
-            }
-            if let wantNetwork = want.network {
-                #expect(shape["network"] as? String == wantNetwork, "\(vector.id) network")
-            }
-
-            // Canonical (v2) shape carries an `accepted` and NO top-level
-            // scheme/network; the legacy (v1) shape is the inverse.
-            if want.hasAccepted {
-                #expect(shape["scheme"] == nil, "\(vector.id) v2 no top-level scheme")
-                #expect(shape["network"] == nil, "\(vector.id) v2 no top-level network")
-            }
-
-            // v2 vectors assert the echoed accepted fields.
-            if want.hasAccepted, let accepted = shape["accepted"] as? [String: Any] {
-                if let s = want.acceptedScheme {
-                    #expect(accepted["scheme"] as? String == s, "\(vector.id) acceptedScheme")
-                }
-                if let n = want.acceptedNetwork {
-                    #expect(accepted["network"] as? String == n, "\(vector.id) acceptedNetwork")
-                }
-                if let a = want.acceptedAsset {
-                    #expect(accepted["asset"] as? String == a, "\(vector.id) acceptedAsset")
-                }
-                if let p = want.acceptedPayTo {
-                    #expect(accepted["payTo"] as? String == p, "\(vector.id) acceptedPayTo")
-                }
-                if let amt = want.acceptedAmount {
-                    #expect(accepted["amount"] as? String == amt, "\(vector.id) acceptedAmount")
-                }
-            }
-        }
-    }
-
-    /// Offers built from the vector corpus pin no blockhash, so add a known
-    /// one to keep the builder offline (no RPC round-trip in unit tests).
-    private func _withBlockhash(_ extra: [String: JSONValue]?) -> [String: JSONValue] {
-        var merged = extra ?? [:]
-        if merged["recentBlockhash"] == nil {
-            merged["recentBlockhash"] = .string(LegacyFixtures.knownBlockhash)
-        }
-        return merged
-    }
-
-    private func _decodeShape(_ header: String) throws -> [String: Any] {
-        guard let data = Data(base64Encoded: header) else {
-            throw PayKitError.invalidTransaction("header is not standard base64")
-        }
-        return try JSONSerialization.jsonObject(with: data) as! [String: Any]
-    }
 }
 
 // MARK: - Legacy producer unit tests
@@ -191,6 +33,7 @@ struct X402LegacyBuildVectorTests {
 struct X402LegacyProducerTests {
     static func devnetOffer() -> X402AcceptsEntry {
         let extra: [String: JSONValue] = [
+            "feePayer": .string(x402TestFeePayer),
             "recentBlockhash": .string(LegacyFixtures.knownBlockhash),
             "decimals": .int(6),
         ]
@@ -232,7 +75,8 @@ struct X402LegacyProducerTests {
     func legacyHeaderIsStandardBase64NotUrlSafe() async throws {
         // A standard-base64 string round-trips through Data(base64Encoded:);
         // url-safe ('-'/'_') would not. Use a SOL offer (no ATA dependency).
-        let extra: [String: JSONValue] = ["recentBlockhash": .string(LegacyFixtures.knownBlockhash)]
+        let extra: [String: JSONValue] = [
+            "feePayer": .string(x402TestFeePayer),"recentBlockhash": .string(LegacyFixtures.knownBlockhash)]
         let offer = X402AcceptsEntry(
             scheme: "exact", network: SolanaNetwork.mainnet,
             amount: "1000", maxAmountRequired: nil,
@@ -255,7 +99,7 @@ struct X402LegacyProducerTests {
             amount: "1000", maxAmountRequired: nil,
             asset: "SOL", payTo: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
             recipient: nil,
-            extra: ["recentBlockhash": .string(LegacyFixtures.knownBlockhash)]
+            extra: ["feePayer": .string(x402TestFeePayer), "recentBlockhash": .string(LegacyFixtures.knownBlockhash)]
         )
         let mainnetHeader = try await buildX402LegacyPaymentHeader(
             signer: try LegacyFixtures.makeSigner(), rpc: LegacyFixtures.makeRpc(), offer: mainnet
@@ -268,7 +112,7 @@ struct X402LegacyProducerTests {
             amount: "1000", maxAmountRequired: nil,
             asset: "SOL", payTo: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
             recipient: nil,
-            extra: ["recentBlockhash": .string(LegacyFixtures.knownBlockhash)]
+            extra: ["feePayer": .string(x402TestFeePayer), "recentBlockhash": .string(LegacyFixtures.knownBlockhash)]
         )
         let testnetHeader = try await buildX402LegacyPaymentHeader(
             signer: try LegacyFixtures.makeSigner(), rpc: LegacyFixtures.makeRpc(), offer: testnet
@@ -319,6 +163,7 @@ struct X402LegacyChallengeParseTests {
             "error": "X-PAYMENT header is required",
             "accepts": [{
                 "scheme": "exact",
+                "extra": {"feePayer": "\(x402TestFeePayer)"},
                 "network": "solana-devnet",
                 "maxAmountRequired": "1000",
                 "asset": "\(Mints.usdcDevnet)",
@@ -344,6 +189,7 @@ struct X402LegacyChallengeParseTests {
             "x402Version": 1,
             "accepts": [{
                 "scheme": "exact",
+                "extra": {"feePayer": "\(x402TestFeePayer)"},
                 "network": "solana-devnet",
                 "maxAmountRequired": "1000",
                 "asset": "\(Mints.usdcDevnet)",
@@ -360,9 +206,9 @@ struct X402LegacyChallengeParseTests {
     func readsCanonicalHeaderBeforeLegacyHeaderBeforeBody() throws {
         let net = SolanaNetwork.devnet
         // Canonical PAYMENT-REQUIRED header (v2) wins over everything.
-        let canonicalEnv = "{\"x402Version\":2,\"accepts\":[{\"scheme\":\"exact\",\"network\":\"\(net)\",\"amount\":\"100\",\"asset\":\"SOL\",\"payTo\":\"from-canonical\"}]}"
-        let legacyEnv = "{\"x402Version\":1,\"accepts\":[{\"scheme\":\"exact\",\"network\":\"solana-devnet\",\"maxAmountRequired\":\"200\",\"asset\":\"SOL\",\"payTo\":\"from-legacy-header\"}]}"
-        let body = "{\"x402Version\":1,\"accepts\":[{\"scheme\":\"exact\",\"network\":\"solana-devnet\",\"maxAmountRequired\":\"300\",\"asset\":\"SOL\",\"payTo\":\"from-body\"}]}"
+        let canonicalEnv = "{\"x402Version\":2,\"accepts\":[{\"scheme\":\"exact\",\"network\":\"\(net)\",\"amount\":\"100\",\"asset\":\"SOL\",\"payTo\":\"from-canonical\",\"extra\":{\"feePayer\":\"\(x402TestFeePayer)\"}}]}"
+        let legacyEnv = "{\"x402Version\":1,\"accepts\":[{\"scheme\":\"exact\",\"network\":\"solana-devnet\",\"maxAmountRequired\":\"200\",\"asset\":\"SOL\",\"payTo\":\"from-legacy-header\",\"extra\":{\"feePayer\":\"\(x402TestFeePayer)\"}}]}"
+        let body = "{\"x402Version\":1,\"accepts\":[{\"scheme\":\"exact\",\"network\":\"solana-devnet\",\"maxAmountRequired\":\"300\",\"asset\":\"SOL\",\"payTo\":\"from-body\",\"extra\":{\"feePayer\":\"\(x402TestFeePayer)\"}}]}"
 
         let headers = [
             (name: "PAYMENT-REQUIRED", value: Data(canonicalEnv.utf8).base64EncodedString()),
@@ -400,7 +246,7 @@ struct X402LegacyChallengeParseTests {
                 "maxAmountRequired": "1000",
                 "asset": "\(Mints.usdcDevnet)",
                 "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
-                "extra": { "recentBlockhash": "\(LegacyFixtures.knownBlockhash)", "decimals": 6 }
+                "extra": { "feePayer": "\(x402TestFeePayer)", "recentBlockhash": "\(LegacyFixtures.knownBlockhash)", "decimals": 6 }
             }]
         }
         """

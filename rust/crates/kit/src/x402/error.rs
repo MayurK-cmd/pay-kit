@@ -34,6 +34,11 @@ pub enum Error {
     #[error("Transaction signature already consumed")]
     SignatureConsumed,
 
+    /// The settlement was broadcast but its outcome is unknown. The claim is
+    /// kept; retrying the same payment reconciles it.
+    #[error("Settlement pending: {0}")]
+    SettlementPending(String),
+
     #[error("Simulation failed: {0}")]
     SimulationFailed(String),
 
@@ -55,8 +60,32 @@ pub enum Error {
     #[error("Payment header missing from 402 response")]
     MissingPaymentHeader,
 
+    /// The route requires the `payment-identifier` extension and the
+    /// credential carried no id, or carried one that violates the format.
+    /// The extension spec answers this with HTTP 400 (see [`Error::http_status`]).
+    #[error("payment-identifier required: {0}")]
+    PaymentIdentifierRequired(String),
+
+    /// A v2 credential's `accepted` requirements match none of the options
+    /// the route offers (for example a credential issued for another route
+    /// or price). The payment is for something this route does not sell.
+    #[error("Credential's accepted does not match any offered payment option")]
+    AcceptedMismatch,
+
     #[error("{0}")]
     Other(String),
+}
+
+impl Error {
+    /// HTTP status a resource server answers with when payment verification
+    /// fails with this error: 400 for a missing or malformed required
+    /// `payment-identifier` (per the extension spec), 402 otherwise.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            Error::PaymentIdentifierRequired(_) => 400,
+            _ => 402,
+        }
+    }
 }
 
 impl From<crate::core::Error> for Error {

@@ -9,7 +9,11 @@ attribute / mapping / ``.state`` request shapes.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
+from solana_keychain import TransactionSigner
+from solders.pubkey import Pubkey
 
 from solana_pay_kit import (
     Gate,
@@ -27,6 +31,7 @@ from solana_pay_kit import (
     require_payment,
 )
 from solana_pay_kit._middleware import PAYMENT_ATTR, PayCore
+from solana_pay_kit._paycore.store import ConsumedSignatures
 from solana_pay_kit.config import reset
 from solana_pay_kit.errors import (
     ChallengeExpiredError,
@@ -108,14 +113,22 @@ async def test_settled_signature_not_replayable_across_requests(monkeypatch):
     by one request's core stays consumed for the next request's core."""
     cfg = _cfg(accept=(Protocol.MPP,))
     store = PayCore.for_config(cfg)._mpp._replay_store
-    key = "solana-charge:consumed:sig-xyz"
     # First request settles the signature (marks it consumed).
-    assert await store.put_if_absent(key, True) is True
+    assert await ConsumedSignatures(store).claim("sig-xyz") is True
     # A later request resolves the SAME core/store, so the marker persists and
-    # a replay of the same signature is rejected (put_if_absent returns False).
+    # a replay of the same signature is rejected (claim returns False).
     store_again = PayCore.for_config(cfg)._mpp._replay_store
     assert store_again is store
-    assert await store_again.put_if_absent(key, True) is False
+    assert await ConsumedSignatures(store_again).claim("sig-xyz") is False
+
+
+def test_mpp_and_x402_share_one_replay_store():
+    """One payment authorizes one request across protocols: both adapters of a
+    dual gate claim signatures in the same store, so an MPP-settled signature
+    is consumed for x402 too (and vice versa)."""
+    core = PayCore(_cfg(accept=(Protocol.MPP, Protocol.X402)))
+    assert core._x402 is not None
+    assert core._mpp._replay_store is core._x402._store
 
 
 # -- gate resolution ---------------------------------------------------------
@@ -391,22 +404,66 @@ def test_require_payment_raises_when_unpaid():
         require_payment(_Req())
 
 
-# -- kms reserved namespace --------------------------------------------------
+# -- native kms factories ---------------------------------------------------
 
 
-def test_kms_gcp_not_implemented():
-    with pytest.raises(NotImplementedError, match="follow-up"):
-        kms.gcp(key_name="k", pubkey="p")
+# solana_keychain's cloud modules raise a plain ImportError (not
+# ModuleNotFoundError) when their extra is missing, and pytest>=9 only skips on
+# ModuleNotFoundError by default, so each importorskip names ImportError.
 
 
-def test_kms_aws_not_implemented():
-    with pytest.raises(NotImplementedError, match="follow-up"):
-        kms.aws(key_id="k", region="us", pubkey="p")
+async def test_kms_gcp_returns_native_signer():
+    pytest.importorskip("solana_keychain.gcp_kms", exc_type=ImportError)
+    client = MagicMock()
+    signer = await kms.gcp(key_name="k", pubkey=FEE_A, client=client)
+    assert isinstance(signer, TransactionSigner)
+    assert signer.pubkey == Pubkey.from_string(FEE_A)
+    assert client.mock_calls == []
 
 
-def test_kms_vault_not_implemented():
-    with pytest.raises(NotImplementedError, match="follow-up"):
-        kms.vault(addr="a", path="p", pubkey="k")
+async def test_kms_gcp_constructs_client_on_signing_loop(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from solders.keypair import Keypair
+
+    pytest.importorskip("solana_keychain.gcp_kms", exc_type=ImportError)
+    kms_v1 = pytest.importorskip("google.cloud.kms_v1")
+
+    keypair = Keypair()
+    constructed = []
+
+    class LoopBoundClient:
+        def __init__(self):
+            self.loop = asyncio.get_running_loop()
+            constructed.append(self)
+
+        async def asymmetric_sign(self, *, request):
+            assert asyncio.get_running_loop() is self.loop
+            return SimpleNamespace(signature=bytes(keypair.sign_message(request["data"])))
+
+    monkeypatch.setattr(kms_v1, "KeyManagementServiceAsyncClient", LoopBoundClient)
+    pending = kms.gcp(key_name="k", pubkey=str(keypair.pubkey()))
+    assert constructed == []
+    signer = await pending
+    signature = await signer.sign_message(b"loop-bound signing")
+    assert signature.verify(keypair.pubkey(), b"loop-bound signing")
+    assert len(constructed) == 1
+
+
+def test_kms_aws_returns_native_signer():
+    pytest.importorskip("solana_keychain.aws_kms", exc_type=ImportError)
+    client = MagicMock()
+    signer = kms.aws(key_id="k", region="us-east-1", pubkey=FEE_A, client=client)
+    assert isinstance(signer, TransactionSigner)
+    assert signer.pubkey == Pubkey.from_string(FEE_A)
+    assert client.mock_calls == []
+
+
+def test_kms_vault_returns_native_signer():
+    signer = kms.vault(addr="https://vault.example", path="operator", pubkey=FEE_A, token="test-token")
+    assert isinstance(signer, TransactionSigner)
+    assert signer.pubkey == Pubkey.from_string(FEE_A)
 
 
 # -- errors ------------------------------------------------------------------

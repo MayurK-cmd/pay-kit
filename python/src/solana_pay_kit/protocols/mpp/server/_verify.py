@@ -12,7 +12,10 @@ orchestration that drives broadcast / confirmation lives in
 from __future__ import annotations
 
 import base64
+from collections import Counter
 from typing import Any
+
+from solana_keychain import TransactionSigner
 
 from solana_pay_kit._paycore.errors import PaymentError
 from solana_pay_kit._paycore.solana import (
@@ -25,6 +28,7 @@ from solana_pay_kit._paycore.solana import (
     is_native_sol,
     resolve_mint,
 )
+from solana_pay_kit._paycore.transaction import SignatureCheckError, verify_required_signatures
 from solana_pay_kit.protocols.mpp.intents.charge import ChargeRequest
 from solana_pay_kit.protocols.mpp.server._tx_decode import (
     _COMPUTE_BUDGET_PROGRAM,
@@ -43,22 +47,19 @@ from solana_pay_kit.protocols.mpp.server._tx_decode import (
 )
 
 
-def _co_sign_with_fee_payer(transaction_b64: str, fee_payer: Any) -> str:
-    """Co-sign a client transaction with the server's fee payer keypair.
+async def _co_sign_with_fee_payer(transaction_b64: str, fee_payer: TransactionSigner) -> str:
+    """Co-sign a client transaction with the server's native fee-payer signer.
 
-    The fee payer occupies the first signer slot in Solana transactions. We
-    sign ``to_bytes_versioned(msg)`` (exactly what the wire carries: the
-    ``0x80`` version tag plus the v0 body, or the bare legacy message) with
-    the fee-payer private key and splice the resulting signature into the
-    signature array at the slot matching the fee-payer pubkey.
+    Require the canonical fee-payer slot before requesting a signature. Native
+    keychain signing preserves the other signatures for both v0 and legacy
+    messages; its returned transaction is authoritative.
 
     Mirrors the cosign step in rust/src/server/charge.rs verify_pull.
     """
-    from solders.message import to_bytes_versioned
     from solders.transaction import VersionedTransaction
 
     raw = base64.b64decode(transaction_b64)
-    fee_payer_pubkey = fee_payer.pubkey()
+    fee_payer_pubkey = fee_payer.pubkey
 
     try:
         vtx = VersionedTransaction.from_bytes(raw)
@@ -77,15 +78,8 @@ def _co_sign_with_fee_payer(transaction_b64: str, fee_payer: Any) -> str:
         ) from exc
     num_required = int(vtx.message.header.num_required_signatures)
     _assert_signature_slot(idx, num_required)
-    message_bytes = bytes(to_bytes_versioned(vtx.message))
-    sig_bytes = bytes(fee_payer.sign_message(message_bytes))
-    # Manual splice in the on-wire bytes preserves the rest of the
-    # transaction exactly. Wire format: [num_sigs (compact-u16)] [sigs]
-    # [message...]. num_sigs < 128 so it is a 1-byte prefix.
-    serialized = bytearray(raw)
-    sig_start = 1 + idx * 64
-    serialized[sig_start : sig_start + 64] = sig_bytes
-    return base64.b64encode(bytes(serialized)).decode("ascii")
+    signed = await fee_payer.sign_transaction(vtx)
+    return base64.b64encode(bytes(signed.transaction)).decode("ascii")
 
 
 def _assert_signature_slot(idx: int, num_required: int) -> None:
@@ -323,7 +317,7 @@ def _validate_instruction_allowlist(
     fee_payer_account = account_keys[0]
     # SECURITY: when the charge advertises feePayer=true the protective
     # pubkey used for drain detection MUST come from the server-side
-    # signing context (``Mpp._fee_payer_signer.pubkey()``), NOT from
+    # signing context (``Mpp._fee_payer_signer.pubkey``), NOT from
     # client-echoed ``methodDetails.feePayerKey``. A malicious client can
     # tamper the echoed key to a pubkey it controls, pass the source-account
     # checks below (because they compare against the tampered value), and
@@ -355,13 +349,27 @@ def _validate_instruction_allowlist(
         )
     allowed_ata_owners, required_ata_owners = _expected_ata_creation_policy(details, fee_payer_pubkey)
     created_ata_owners: set[str] = set()
-    expected_memos = {memo for _label, memo in _expected_memos(request, details)}
-
     # Track which required transfers / memos have been satisfied so each
     # required entry can only be matched once; an attacker cannot replay
-    # a single transfer to cover two required legs.
+    # a single transfer to cover two required legs. Memos are a multiset:
+    # two splits with the same memo text are distinct payment legs that
+    # "MUST be verified separately" (draft-solana-charge-00, Method
+    # Details), so each one admits its own Memo instruction.
     remaining_transfers: list[tuple[str, int]] = list(expected_transfers)
-    remaining_memos: set[str] = set(expected_memos)
+    remaining_memos: Counter[str] = Counter(memo for _label, memo in _expected_memos(request, details))
+    # Every payment leg must be funded by one authority. A sponsor pays a
+    # signature fee per required signer, so letting each leg of a split name
+    # its own authority would let a payer multiply the fees the sponsor pays.
+    funding_authority: str | None = None
+
+    def _record_funding_authority(authority: str) -> None:
+        nonlocal funding_authority
+        if funding_authority is not None and funding_authority != authority:
+            raise PaymentError(
+                "payment transfers must share one funding authority",
+                code="invalid-payload",
+            )
+        funding_authority = authority
 
     for instruction in message_instructions:
         try:
@@ -389,12 +397,12 @@ def _validate_instruction_allowlist(
                     "memo instruction is not valid UTF-8",
                     code="invalid-payload",
                 ) from exc
-            if memo_text not in remaining_memos:
+            if remaining_memos[memo_text] <= 0:
                 raise PaymentError(
                     "unexpected Memo Program instruction in payment transaction",
                     code="invalid-payload",
                 )
-            remaining_memos.discard(memo_text)
+            remaining_memos[memo_text] -= 1
             continue
 
         if program_id == _MEMO_V1_PROGRAM:
@@ -449,6 +457,7 @@ def _validate_instruction_allowlist(
                     code="invalid-payload",
                 )
             remaining_transfers.pop(match_idx)
+            _record_funding_authority(source)
             continue
 
         if program_id in {TOKEN_PROGRAM, TOKEN_2022_PROGRAM}:
@@ -529,6 +538,7 @@ def _validate_instruction_allowlist(
                     code="invalid-payload",
                 )
             remaining_transfers.pop(match_idx)
+            _record_funding_authority(authority)
             continue
 
         if program_id == ASSOCIATED_TOKEN_PROGRAM:
@@ -560,6 +570,51 @@ def _validate_instruction_allowlist(
                 code="invalid-payload",
             )
 
+    # Every required signer must be the fee payer or the one funding
+    # authority. Any other signer authorizes nothing and only adds a
+    # signature fee, which a sponsor would pay.
+    allowed_signers = {fee_payer_account, funding_authority}
+    num_required = int(message.header.num_required_signatures)
+    if any(signer not in allowed_signers for signer in account_keys[:num_required]):
+        raise PaymentError(
+            "unexpected signer in payment transaction",
+            code="invalid-payload",
+        )
+
+
+def _verify_signatures(raw_tx: bytes, *, unsigned_fee_payer: str | None = None) -> None:
+    """Refuse a transaction unless every required signer's signature verifies.
+
+    The wire must carry exactly ``num_required_signatures`` signatures, each
+    valid over the message: a landed multi-signer transaction truncated to
+    its first signature would otherwise pass a slot-by-slot check (RULINGS
+    SIG1). ``unsigned_fee_payer`` names the server's own fee payer, whose slot
+    may still be the zero placeholder before it co-signs; every other slot
+    must verify.
+
+    Runs in charge verification (before the cosign) and again on the exact
+    co-signed bytes before the signature is claimed or sent. A forged
+    signature would otherwise name the charge: the node refuses it without a
+    preflight result, the charge is kept as possibly sent, and a retry would
+    reconcile on the status of whatever landed transaction owns that
+    signature.
+    """
+    from solders.pubkey import Pubkey
+    from solders.transaction import VersionedTransaction
+
+    try:
+        transaction = VersionedTransaction.from_bytes(raw_tx)
+    except Exception as exc:  # noqa: BLE001
+        raise PaymentError(f"could not decode signed transaction: {exc}", code="invalid-payload") from exc
+    try:
+        unsigned = Pubkey.from_string(unsigned_fee_payer) if unsigned_fee_payer is not None else None
+    except ValueError as exc:
+        raise PaymentError(f"invalid fee payer key: {exc}", code="invalid-payload") from exc
+    try:
+        verify_required_signatures(transaction, unsigned=unsigned)
+    except SignatureCheckError as exc:
+        raise PaymentError(f"transaction signature verification failed: {exc}", code="invalid-payload") from exc
+
 
 def _verify_local_transaction_intent(
     transaction_b64: str,
@@ -570,7 +625,7 @@ def _verify_local_transaction_intent(
     """Verify locally-decodable payment intent before broadcasting.
 
     ``expected_fee_payer_pubkey`` is the AUTHORITATIVE server-side fee-payer
-    pubkey (``Mpp._fee_payer_signer.pubkey()``). It is threaded by
+    pubkey (``Mpp._fee_payer_signer.pubkey``). It is threaded by
     ``_verify_transaction`` so the no-leftovers allowlist can detect drain
     attempts against the real server key, not against a client-echoed
     ``methodDetails.feePayerKey`` value (which an attacker controls). When
@@ -606,3 +661,12 @@ def _verify_local_transaction_intent(
         details,
         expected_fee_payer_pubkey=expected_fee_payer_pubkey,
     )
+    # RULINGS SIG1: the client's signatures must authorize this exact
+    # message before anything co-signs, claims or sends it. Checked last so a
+    # transaction that violates the payment policy is refused for that reason.
+    # Only the server's fee-payer slot may still be empty (pre-cosign); it
+    # resolves the same way as the allowlist's fee payer above.
+    unsigned_fee_payer: str | None = None
+    if details.fee_payer:
+        unsigned_fee_payer = expected_fee_payer_pubkey or details.fee_payer_key or None
+    _verify_signatures(base64.b64decode(transaction_b64), unsigned_fee_payer=unsigned_fee_payer)

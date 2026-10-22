@@ -1,6 +1,7 @@
 //! Client-side implementations for the charge, session, and subscription intents.
 
 pub mod authenticate;
+pub mod channel_charge;
 mod charge;
 #[cfg(feature = "confidential")]
 pub(crate) mod confidential;
@@ -15,13 +16,17 @@ pub use authenticate::{
     build_credential as build_authenticate_credential,
     build_credential_header as build_authenticate_credential_header,
 };
+pub use channel_charge::{
+    build_channel_charge_credential, build_channel_charge_credential_with_options,
+};
 pub use charge::*;
 pub use http_stream::*;
 pub use session::{
     build_open_payment_channel_transaction, create_payment_channel_session_opener,
     derive_payment_channel_open, BuildOpenPaymentChannelTransactionParams,
     DerivePaymentChannelOpenParams, PaymentChannelOpen, PaymentChannelOpenOptions,
-    PaymentChannelSessionOpen, PaymentChannelSessionOpenOptions, DEFAULT_GRACE_PERIOD_SECONDS,
+    PaymentChannelSessionOpen, PaymentChannelSessionOpenOptions, SessionPayout,
+    DEFAULT_GRACE_PERIOD_SECONDS,
 };
 pub use session_consumer::*;
 pub use subscription::{

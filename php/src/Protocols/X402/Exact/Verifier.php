@@ -123,10 +123,41 @@ final class Verifier
             }
         }
 
+        // scheme_exact_svm §2.1.1: the fee payer "MUST NOT appear in the
+        // `accounts` list of any instruction ... and MUST NOT be invoked as a
+        // program" (RULINGS S3). verifyTransfer only covers ix[2]; sweep the
+        // optional Memo / Lighthouse slots too.
+        foreach ($instructions as $ix) {
+            $keys = [self::programOf($accountKeys, $ix)];
+            foreach ($ix->accountKeyIndexes as $idx) {
+                $keys[] = $accountKeys[$idx] ?? null;
+            }
+            if (array_intersect($keys, $managedSigners) !== []) {
+                throw new InvalidProofException(
+                    'invalid_exact_svm_payload_transaction_fee_payer_in_instruction_accounts',
+                );
+            }
+        }
+
         // Rule 10: memo binding.
         $expectedMemo = self::stringExtra($requirement, 'memo', false);
         if ($expectedMemo !== null && $expectedMemo !== '') {
             self::findMemoMatch($accountKeys, $instructions, $expectedMemo);
+        }
+
+        // Rule 12: every client signature verifies over the message before
+        // the facilitator co-signs or sends (RULINGS SIG1). Only the
+        // facilitator's own fee-payer slot may still be empty.
+        $feePayer = $tx->staticAccountKeys()[0] ?? null;
+        $unsignedFeePayer = $feePayer !== null && in_array((string) $feePayer, $managedSigners, true)
+            ? $feePayer
+            : null;
+        try {
+            $tx->assertSignaturesVerify($unsignedFeePayer);
+        } catch (Throwable $error) {
+            throw new InvalidProofException(
+                'invalid_exact_svm_payload_transaction_signature: ' . $error->getMessage(),
+            );
         }
 
         return $transfer;
@@ -239,10 +270,12 @@ final class Verifier
             throw new InvalidProofException('invalid_exact_svm_payload_recipient_mismatch');
         }
 
-        // Rule 8: amount match.
+        // Rule 8: scheme_exact_svm §1.4, the matching transfer is "at least"
+        // the required amount: overpayment is tolerated, less is rejected. A u64
+        // at or above 2^63 unpacks negative here, so it fails closed.
         $amount = self::readU64Le($data, 1);
         $expectedAmount = self::amountField($requirement);
-        if ($amount !== $expectedAmount) {
+        if ($amount < $expectedAmount) {
             throw new InvalidProofException('invalid_exact_svm_payload_amount_mismatch');
         }
 

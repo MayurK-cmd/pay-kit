@@ -36,14 +36,13 @@ func newTestMpp(t *testing.T) (*Mpp, *testutil.FakeRPC, testutilConfig) {
 		Client:    testutil.NewPrivateKey(),
 		SecretKey: "test-secret-key-0123456789abcdef",
 	}
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient: cfg.Recipient,
 		Currency:  "sol",
 		Decimals:  9,
 		Network:   "localnet",
 		SecretKey: cfg.SecretKey,
 		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
 		// Push-mode (type="signature") credentials are opt-in (#5); the shared
 		// fixture enables them so the signature-flow tests exercise settlement.
 		AcceptPushMode: true,
@@ -223,14 +222,13 @@ func TestVerifyCredentialRejectsSponsoredPushMode(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	recipient := testutil.NewPrivateKey()
 	feePayer := testutil.NewPrivateKey()
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient:      recipient.PublicKey().String(),
 		Currency:       "sol",
 		Decimals:       9,
 		Network:        "localnet",
 		SecretKey:      "test-secret-key-0123456789abcdef",
 		RPC:            rpcClient,
-		Store:          core.NewMemoryStore(),
 		FeePayerSigner: feePayer,
 	})
 	if err != nil {
@@ -258,14 +256,14 @@ func TestVerifyCredentialTokenSignatureSuccess(t *testing.T) {
 	clientSigner := testutil.NewPrivateKey()
 	mint := testutil.NewPrivateKey().PublicKey()
 	rpcClient.MintOwners[mint.String()] = solana.TokenProgramID
-	handler, err := New(Config{
+	rpcClient.MintDecimals[mint.String()] = 6
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient:      recipient.PublicKey().String(),
 		Currency:       mint.String(),
 		Decimals:       6,
 		Network:        "localnet",
 		SecretKey:      "test-secret-key-0123456789abcdef",
 		RPC:            rpcClient,
-		Store:          core.NewMemoryStore(),
 		AcceptPushMode: true,
 	})
 	if err != nil {
@@ -298,14 +296,13 @@ func TestVerifyCredentialUSDCSymbolSignatureSuccess(t *testing.T) {
 	clientSigner := testutil.NewPrivateKey()
 	usdcMint := solana.MustPublicKeyFromBase58("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 	rpcClient.MintOwners[usdcMint.String()] = solana.TokenProgramID
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient:      recipient.PublicKey().String(),
 		Currency:       "USDC",
 		Decimals:       6,
 		Network:        "localnet",
 		SecretKey:      "test-secret-key-0123456789abcdef",
 		RPC:            rpcClient,
-		Store:          core.NewMemoryStore(),
 		AcceptPushMode: true,
 	})
 	if err != nil {
@@ -597,13 +594,13 @@ func TestVerifyCredentialExpiredChallengeRejected(t *testing.T) {
 }
 
 func TestNewMissingRecipient(t *testing.T) {
-	if _, err := New(Config{SecretKey: "secret"}); err == nil {
+	if _, err := New(core.NewMemoryStore(), Config{SecretKey: "secret"}); err == nil {
 		t.Fatal("expected error for missing recipient")
 	}
 }
 
 func TestNewInvalidRecipientPubkey(t *testing.T) {
-	if _, err := New(Config{Recipient: "not-a-pubkey", SecretKey: "secret"}); err == nil {
+	if _, err := New(core.NewMemoryStore(), Config{Recipient: "not-a-pubkey", SecretKey: "secret"}); err == nil {
 		t.Fatal("expected error for invalid recipient pubkey")
 	}
 }
@@ -611,7 +608,7 @@ func TestNewInvalidRecipientPubkey(t *testing.T) {
 func TestNewMissingSecretKey(t *testing.T) {
 	t.Setenv("MPP_SECRET_KEY", "")
 	recipient := testutil.NewPrivateKey().PublicKey().String()
-	if _, err := New(Config{Recipient: recipient}); err == nil {
+	if _, err := New(core.NewMemoryStore(), Config{Recipient: recipient}); err == nil {
 		t.Fatal("expected error for missing secret key")
 	}
 }
@@ -621,7 +618,7 @@ func TestNewSecretKeyFromEnv(t *testing.T) {
 	t.Setenv("MPP_SECRET_KEY", envSecret)
 	recipient := testutil.NewPrivateKey().PublicKey().String()
 	rpcClient := testutil.NewFakeRPC()
-	handler, err := New(Config{Recipient: recipient, RPC: rpcClient})
+	handler, err := New(core.NewMemoryStore(), Config{Recipient: recipient, RPC: rpcClient})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -635,7 +632,7 @@ func TestNewRejectsShortEnvSecretKey(t *testing.T) {
 	t.Setenv("MPP_SECRET_KEY", "too-short")
 	recipient := testutil.NewPrivateKey().PublicKey().String()
 	rpcClient := testutil.NewFakeRPC()
-	if _, err := New(Config{Recipient: recipient, RPC: rpcClient}); err == nil {
+	if _, err := New(core.NewMemoryStore(), Config{Recipient: recipient, RPC: rpcClient}); err == nil {
 		t.Fatal("expected error for short env secret key")
 	}
 }
@@ -643,14 +640,13 @@ func TestNewRejectsShortEnvSecretKey(t *testing.T) {
 func TestChargeToken(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	recipient := testutil.NewPrivateKey().PublicKey().String()
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient: recipient,
 		Currency:  "USDC",
 		Decimals:  6,
 		Network:   "localnet",
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -806,14 +802,13 @@ func TestVerifyCredentialGetTxFailure(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	recipient := testutil.NewPrivateKey()
 	clientSigner := testutil.NewPrivateKey()
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient: recipient.PublicKey().String(),
 		Currency:  "sol",
 		Decimals:  9,
 		Network:   "localnet",
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -851,14 +846,13 @@ func TestChargeWithFeePayer(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	feePayer := testutil.NewPrivateKey()
 	recipient := testutil.NewPrivateKey()
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient:      recipient.PublicKey().String(),
 		Currency:       "sol",
 		Decimals:       9,
 		Network:        "localnet",
 		SecretKey:      "test-secret-key-0123456789abcdef",
 		RPC:            rpcClient,
-		Store:          core.NewMemoryStore(),
 		FeePayerSigner: feePayer,
 	})
 	if err != nil {
@@ -887,7 +881,7 @@ func TestChargeWithFeePayer(t *testing.T) {
 func TestNewWithDefaultValues(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	recipient := testutil.NewPrivateKey().PublicKey().String()
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient: recipient,
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       rpcClient,
@@ -895,8 +889,8 @@ func TestNewWithDefaultValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
 	}
-	if handler.currency != "USDC" {
-		t.Fatalf("expected default currency USDC, got %q", handler.currency)
+	if handler.currency != paycore.USDCMainnetMint {
+		t.Fatalf("expected default currency USDC to resolve to the mainnet mint, got %q", handler.currency)
 	}
 	if handler.decimals != 6 {
 		t.Fatalf("expected default decimals 6, got %d", handler.decimals)
@@ -918,14 +912,13 @@ func TestChargeKnownStablecoinTokenPrograms(t *testing.T) {
 		{currency: "CASH", want: paycore.Token2022Program},
 	} {
 		rpcClient := testutil.NewFakeRPC()
-		handler, err := New(Config{
+		handler, err := New(core.NewMemoryStore(), Config{
 			Recipient: testutil.NewPrivateKey().PublicKey().String(),
 			Currency:  tt.currency,
 			Decimals:  6,
 			Network:   "mainnet",
 			SecretKey: "test-secret-key-0123456789abcdef",
 			RPC:       rpcClient,
-			Store:     core.NewMemoryStore(),
 		})
 		if err != nil {
 			t.Fatalf("new mpp failed: %v", err)
@@ -954,14 +947,14 @@ func TestVerifyCredentialTokenTransactionSuccess(t *testing.T) {
 	clientSigner := testutil.NewPrivateKey()
 	mint := testutil.NewPrivateKey().PublicKey()
 	rpcClient.MintOwners[mint.String()] = solana.TokenProgramID
-	handler, err := New(Config{
+	rpcClient.MintDecimals[mint.String()] = 6
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient: recipient.PublicKey().String(),
 		Currency:  mint.String(),
 		Decimals:  6,
 		Network:   "localnet",
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -1005,7 +998,7 @@ func TestVerifyCredentialSignatureSuccess(t *testing.T) {
 func TestRPCURL(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	recipient := testutil.NewPrivateKey().PublicKey().String()
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient: recipient,
 		SecretKey: "test-secret-key-0123456789abcdef",
 		Network:   "devnet",
@@ -1024,14 +1017,13 @@ func TestVerifyCredentialTransactionWithFeePayerSigner(t *testing.T) {
 	recipient := testutil.NewPrivateKey()
 	feePayer := testutil.NewPrivateKey()
 	clientSigner := testutil.NewPrivateKey()
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient:      recipient.PublicKey().String(),
 		Currency:       "sol",
 		Decimals:       9,
 		Network:        "localnet",
 		SecretKey:      "test-secret-key-0123456789abcdef",
 		RPC:            rpcClient,
-		Store:          core.NewMemoryStore(),
 		FeePayerSigner: feePayer,
 	})
 	if err != nil {
@@ -1065,14 +1057,13 @@ func TestVerifyCredentialRejectsTamperedTransferBeforeBroadcast(t *testing.T) {
 	recipient := testutil.NewPrivateKey()
 	feePayer := testutil.NewPrivateKey()
 	clientSigner := testutil.NewPrivateKey()
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient:      recipient.PublicKey().String(),
 		Currency:       "sol",
 		Decimals:       9,
 		Network:        "localnet",
 		SecretKey:      "test-secret-key-0123456789abcdef",
 		RPC:            rpcClient,
-		Store:          core.NewMemoryStore(),
 		FeePayerSigner: feePayer,
 	})
 	if err != nil {
@@ -1559,14 +1550,13 @@ func TestVerifyTransactionSimulateError(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	wrapped := &rpcSimErr{FakeRPC: rpcClient}
 	recipient := testutil.NewPrivateKey()
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient: recipient.PublicKey().String(),
 		Currency:  "sol",
 		Decimals:  9,
 		Network:   "localnet",
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       wrapped,
-		Store:     core.NewMemoryStore(),
 	})
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -1600,14 +1590,13 @@ func TestVerifyTransactionSendError(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	wrapped := &rpcSendErrRPC{FakeRPC: rpcClient}
 	recipient := testutil.NewPrivateKey()
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient: recipient.PublicKey().String(),
 		Currency:  "sol",
 		Decimals:  9,
 		Network:   "localnet",
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       wrapped,
-		Store:     core.NewMemoryStore(),
 	})
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -1641,14 +1630,13 @@ func TestVerifyOnChainTransactionNotFound(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	wrapped := &rpcGetTxErr{FakeRPC: rpcClient}
 	recipient := testutil.NewPrivateKey()
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient: recipient.PublicKey().String(),
 		Currency:  "sol",
 		Decimals:  9,
 		Network:   "localnet",
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       wrapped,
-		Store:     core.NewMemoryStore(),
 	})
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -1685,14 +1673,13 @@ func (errStore) Delete(_ context.Context, _ string) error     { return nil }
 func TestVerifyTransactionStoreError(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	recipient := testutil.NewPrivateKey()
-	handler, err := New(Config{
+	handler, err := New(errStore{}, Config{
 		Recipient: recipient.PublicKey().String(),
 		Currency:  "sol",
 		Decimals:  9,
 		Network:   "localnet",
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       rpcClient,
-		Store:     errStore{},
 	})
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -1718,14 +1705,13 @@ func TestVerifyTransactionStoreError(t *testing.T) {
 func TestVerifyTransactionMissingPrimarySignature(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	recipient := testutil.NewPrivateKey()
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient: recipient.PublicKey().String(),
 		Currency:  "sol",
 		Decimals:  9,
 		Network:   "localnet",
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
 	})
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -1755,14 +1741,13 @@ func TestVerifyTransactionMissingPrimarySignature(t *testing.T) {
 func TestVerifyTransactionWrongNetworkBlockhash(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	recipient := testutil.NewPrivateKey()
-	handler, err := New(Config{
+	handler, err := New(core.NewMemoryStore(), Config{
 		Recipient: recipient.PublicKey().String(),
 		Currency:  "sol",
 		Decimals:  9,
 		Network:   "mainnet",
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
 	})
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -2035,7 +2020,7 @@ func TestVerifySignatureAcceptsLegacyTransaction(t *testing.T) {
 			if receipt.Status != core.ReceiptStatusSuccess {
 				t.Fatalf("unexpected receipt: %#v", receipt)
 			}
-			inserted, err := handler.store.PutIfAbsent(context.Background(), consumedPrefix+signature, true)
+			inserted, err := handler.consumed().Claim(context.Background(), signature)
 			if err != nil {
 				t.Fatalf("store: %v", err)
 			}
@@ -2043,6 +2028,37 @@ func TestVerifySignatureAcceptsLegacyTransaction(t *testing.T) {
 				t.Fatal("settling a legacy transaction must consume the replay marker")
 			}
 		})
+	}
+}
+
+// One on-chain payment authorizes one request across protocols: a
+// signature x402 exact already claimed in the shared store is rejected by
+// MPP charge, while an unclaimed one still settles.
+func TestVerifySignatureRejectsSignatureClaimedByX402(t *testing.T) {
+	handler, rpcClient, _ := newTestMpp(t)
+	challenge, err := handler.Charge(context.Background(), "0.001")
+	if err != nil {
+		t.Fatalf("charge failed: %v", err)
+	}
+	credential, signature := landLegacyPushTransaction(t, rpcClient, handler.recipient, challenge.ToEcho())
+	x402Ledger := paycore.NewConsumedSignatures(handler.store)
+	if claimed, err := x402Ledger.Claim(context.Background(), signature); err != nil || !claimed {
+		t.Fatalf("x402-side claim: claimed=%v err=%v", claimed, err)
+	}
+	_, err = verifyCredentialEchoed(handler, context.Background(), credential)
+	if code := errCode(t, err); code != core.ErrCodeSignatureConsumed {
+		t.Fatalf("code = %q, want %q", code, core.ErrCodeSignatureConsumed)
+	}
+
+	// Positive control: the same payment on a store x402 never touched.
+	handler, rpcClient, _ = newTestMpp(t)
+	challenge, err = handler.Charge(context.Background(), "0.001")
+	if err != nil {
+		t.Fatalf("charge failed: %v", err)
+	}
+	credential, _ = landLegacyPushTransaction(t, rpcClient, handler.recipient, challenge.ToEcho())
+	if _, err := verifyCredentialEchoed(handler, context.Background(), credential); err != nil {
+		t.Fatalf("verify failed: %v", err)
 	}
 }
 

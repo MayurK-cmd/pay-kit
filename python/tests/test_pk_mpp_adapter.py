@@ -8,6 +8,8 @@ HMAC so the pin actually fires.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from solana_pay_kit import Gate, MppConfig, Price, Protocol, Stablecoin, configure
@@ -222,8 +224,10 @@ async def test_matching_route_passes_binding_then_fails_at_settlement():
     auth = _credential_for(adapter, gate)
     with pytest.raises(InvalidProofError) as exc:
         await adapter.verify_and_settle(gate, {"headers": {"authorization": auth}})
-    # Must NOT be a cross-route mismatch: the route lined up, settlement failed.
-    assert exc.value.code != "charge_request_mismatch"
+    # Must NOT be any binding mismatch: the route lined up (the gate expects
+    # the symbol, the challenge carries the mint), and only settlement failed.
+    assert exc.value.code not in ("charge_request_mismatch", "challenge_route_mismatch")
+    assert "mismatch" not in str(exc.value).lower()
 
 
 # -- recent blockhash injection (caveat #5) ----------------------------------
@@ -296,6 +300,24 @@ def test_secret_resolver_generates_and_persists(monkeypatch, tmp_path):
     assert (env_file.stat().st_mode & 0o777) == 0o600
 
 
+def test_secret_resolver_creates_dotenv_private_without_chmod(monkeypatch, tmp_path):
+    """The file is created 0600, never world-readable while the secret lands."""
+    monkeypatch.delenv("PAY_KIT_MPP_CHALLENGE_BINDING_SECRET", raising=False)
+
+    def refuse_chmod(*_args, **_kwargs):
+        raise OSError("chmod refused")
+
+    monkeypatch.setattr(os, "chmod", refuse_chmod)
+    old_umask = os.umask(0o022)
+    try:
+        env_file = tmp_path / ".env"
+        _, source, _ = SecretResolver.resolve_mpp_secret(dotenv_path=str(env_file))
+    finally:
+        os.umask(old_umask)
+    assert source == "generated+persisted"
+    assert (env_file.stat().st_mode & 0o777) == 0o600
+
+
 def test_secret_resolver_generated_is_sticky_across_calls(monkeypatch, tmp_path):
     monkeypatch.delenv("PAY_KIT_MPP_CHALLENGE_BINDING_SECRET", raising=False)
     env_file = tmp_path / ".env"
@@ -335,3 +357,37 @@ def test_adapter_resolves_secret_from_resolver_when_unconfigured(monkeypatch, tm
     )
     adapter = MppAdapter(cfg)
     assert adapter._secret == "adapter-env-secret"
+
+
+@pytest.mark.asyncio
+async def test_settlement_in_progress_keeps_its_retry_signal(monkeypatch):
+    """An unresolved settlement surfaces as SettlementInProgressError (409, no
+    challenge), never as a plain invalid proof the client would re-pay."""
+    from solana_pay_kit._paycore.errors import PaymentError
+    from solana_pay_kit.errors import SettlementInProgressError
+    from solana_pay_kit.protocols.mpp.server.charge import Mpp
+
+    cfg = _cfg()
+    adapter = MppAdapter(cfg)
+    gate = _gate(cfg, name="report", amount="0.10")
+    auth = _credential_for(adapter, gate)
+
+    async def pending(self, credential, expected):
+        raise PaymentError("transaction is pending; retry", code="settlement-in-progress", retryable=True)
+
+    monkeypatch.setattr(Mpp, "verify_credential_with_expected", pending)
+    with pytest.raises(SettlementInProgressError) as exc:
+        await adapter.verify_and_settle(gate, {"headers": {"authorization": auth}})
+    assert exc.value.code == "settlement_in_progress"
+    assert exc.value.http_status == 409
+    assert exc.value.response_headers["Retry-After"] == "1"
+
+    # Positive control: a rejection stays a plain invalid proof.
+    async def rejected(self, credential, expected):
+        raise PaymentError("transaction failed", code="transaction-failed")
+
+    monkeypatch.setattr(Mpp, "verify_credential_with_expected", rejected)
+    with pytest.raises(InvalidProofError) as exc2:
+        await adapter.verify_and_settle(gate, {"headers": {"authorization": auth}})
+    assert not isinstance(exc2.value, SettlementInProgressError)
+    assert exc2.value.code == "payment_invalid"

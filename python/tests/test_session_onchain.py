@@ -347,10 +347,13 @@ async def test_verify_open_tx_rejects_bad_encoding_and_fee_payer() -> None:
 class _MainnetLikeRpc:
     """Mock RPC that, like mainnet, rejects a duplicate send at preflight."""
 
-    def __init__(self, *, account: object | None, status: dict | None) -> None:
+    def __init__(self, *, account: object | None, status: dict | None, context_slots: list[int] | None = None) -> None:
         self.sent: list[bytes] = []
         self.account = account
         self.status = status
+        # Context slot served by successive account reads; the last repeats.
+        self.context_slots = context_slots or [100]
+        self.reads = 0
 
     async def send_raw_transaction(self, raw_tx: bytes) -> object:
         if raw_tx in self.sent:
@@ -371,7 +374,9 @@ class _MainnetLikeRpc:
         del commitment
         from types import SimpleNamespace
 
-        return SimpleNamespace(value=self.account)
+        slot = self.context_slots[min(self.reads, len(self.context_slots) - 1)]
+        self.reads += 1
+        return SimpleNamespace(value=self.account, context=SimpleNamespace(slot=slot))
 
     async def get_latest_blockhash(self, commitment: str = "confirmed") -> object:
         del commitment
@@ -382,7 +387,7 @@ def _first_signature(raw_tx: bytes) -> str:
     return str(VersionedTransaction.from_bytes(raw_tx).signatures[0])
 
 
-_LANDED_CLEAN = {"err": None, "confirmationStatus": "finalized"}
+_LANDED_CLEAN = {"err": None, "confirmationStatus": "finalized", "slot": 100}
 
 
 def _open_config(fixture: _Fixture) -> SessionConfig:
@@ -402,29 +407,20 @@ def _channel_account(fixture: _Fixture) -> object:
     """The confirmed on-chain channel account the fixture's open creates."""
     from types import SimpleNamespace
 
-    from solana_pay_kit.protocols.programs.paymentchannels.accounts.channel import Channel
+    from ._channel_fixture import channel_account_bytes
 
-    body = Channel.layout.build(
-        {
-            "version": 1,
-            "bump": 255,
-            "status": 0,
-            "salt": fixture.payload.salt,
-            "deposit": int(fixture.payload.deposit_amount),
-            "settlement": {"settled": 0, "payoutWatermark": 0},
-            "closureStartedAt": 0,
-            "payerWithdrawnAt": 0,
-            "gracePeriod": fixture.payload.grace_period_seconds,
-            "distributionHash": [0] * 32,
-            "payer": Pubkey.from_string(fixture.payload.payer),
-            "payee": Pubkey.from_string(fixture.payload.payee),
-            "authorizedSigner": Pubkey.from_string(fixture.payload.authorized_signer),
-            "mint": Pubkey.from_string(fixture.payload.mint),
-            "rentPayer": Pubkey.from_string(fixture.payload.payer),
-            "openSlot": fixture.payload.open_slot,
-        }
+    wire = channel_account_bytes(
+        salt=fixture.payload.salt,
+        deposit=int(fixture.payload.deposit_amount),
+        grace_period=fixture.payload.grace_period_seconds,
+        payer=Pubkey.from_string(fixture.payload.payer),
+        payee=Pubkey.from_string(fixture.payload.payee),
+        authorized_signer=Pubkey.from_string(fixture.payload.authorized_signer),
+        mint=Pubkey.from_string(fixture.payload.mint),
+        rent_payer=Pubkey.from_string(fixture.payload.payer),
+        open_slot=fixture.payload.open_slot,
     )
-    return SimpleNamespace(owner=PROGRAM_ID, data=bytes([7]) + bytes(body))
+    return SimpleNamespace(owner=PROGRAM_ID, data=wire)
 
 
 async def test_open_verifier_rescues_landed_open_on_duplicate_preflight_rejection() -> None:
@@ -466,7 +462,8 @@ def _top_up_scenario(*, deposit_after: int) -> tuple[TopUpPayload, ChannelState,
 
     from solana_pay_kit._paycore.solana import resolve_mint
     from solana_pay_kit.protocols.mpp._paymentchannels import TopUpParams, build_top_up_instruction
-    from solana_pay_kit.protocols.programs.paymentchannels.accounts.channel import Channel
+
+    from ._channel_fixture import channel_account_bytes
 
     payer = Keypair.from_seed(bytes([11] * 32))
     channel = Keypair.from_seed(bytes([12] * 32)).pubkey()
@@ -492,27 +489,15 @@ def _top_up_scenario(*, deposit_after: int) -> tuple[TopUpPayload, ChannelState,
         MessageV0.try_compile(payer.pubkey(), [instruction], [], Hash.default()), [payer]
     )
     payload = TopUpPayload(str(channel), "250", base64.b64encode(bytes(transaction)).decode())
-    body = Channel.layout.build(
-        {
-            "version": 1,
-            "bump": 255,
-            "status": 0,
-            "salt": 0,
-            "deposit": deposit_after,
-            "settlement": {"settled": 0, "payoutWatermark": 0},
-            "closureStartedAt": 0,
-            "payerWithdrawnAt": 0,
-            "gracePeriod": 900,
-            "distributionHash": [0] * 32,
-            "payer": payer.pubkey(),
-            "payee": Keypair.from_seed(bytes([14] * 32)).pubkey(),
-            "authorizedSigner": Pubkey.from_string(state.authorized_signer),
-            "mint": mint,
-            "rentPayer": payer.pubkey(),
-            "openSlot": 0,
-        }
+    wire = channel_account_bytes(
+        deposit=deposit_after,
+        payer=payer.pubkey(),
+        payee=Keypair.from_seed(bytes([14] * 32)).pubkey(),
+        authorized_signer=Pubkey.from_string(state.authorized_signer),
+        mint=mint,
+        rent_payer=payer.pubkey(),
     )
-    account = SimpleNamespace(owner=PROGRAM_ID, data=bytes([7]) + bytes(body))
+    account = SimpleNamespace(owner=PROGRAM_ID, data=wire)
     return payload, state, account
 
 
@@ -554,3 +539,145 @@ async def test_top_up_verifier_keeps_broadcast_error_when_signature_never_landed
     verifier = await _seeded_top_up_verifier(rpc, state)
     with pytest.raises(RuntimeError, match="already been processed"):
         await verifier(payload)
+
+
+class _FinalizingRpc(_MainnetLikeRpc):
+    """Reports ``confirmed`` first, then ``finalized``; records read commitments."""
+
+    def __init__(self, *, account: object | None) -> None:
+        super().__init__(account=account, status=None)
+        self.levels = ["confirmed", "finalized"]
+        self.polls = 0
+        self.commitments: list[str] = []
+
+    async def get_signature_statuses(self, signatures: list[str]) -> list[dict | None]:
+        del signatures
+        level = self.levels[min(self.polls, len(self.levels) - 1)]
+        self.polls += 1
+        return [{"err": None, "confirmationStatus": level, "slot": 100}]
+
+    async def get_account_info(self, _addr: object, commitment: str = "confirmed") -> object:
+        self.commitments.append(commitment)
+        return await super().get_account_info(_addr, commitment)
+
+
+async def test_top_up_verifier_credits_only_a_finalized_signature_against_finalized_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload, state, account = _top_up_scenario(deposit_after=1_250)
+    rpc = _FinalizingRpc(account=account)
+    verifier = await _seeded_top_up_verifier(rpc, state)
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("solana_pay_kit.protocols.mpp.server.session_onchain.asyncio.sleep", no_sleep)
+    await verifier(payload)
+    assert rpc.polls == 2
+    assert rpc.commitments == ["finalized"]
+
+
+@pytest.fixture
+def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("solana_pay_kit.protocols.mpp.server.session_onchain.asyncio.sleep", no_sleep)
+
+
+@pytest.mark.usefixtures("_no_sleep")
+async def test_top_up_verifier_waits_for_a_lagging_finalized_read() -> None:
+    # The first read comes from a node behind the finalized status slot; the
+    # verifier re-reads instead of trusting stale state.
+    payload, state, account = _top_up_scenario(deposit_after=1_250)
+    rpc = _MainnetLikeRpc(account=account, status=_LANDED_CLEAN, context_slots=[90, 99, 100])
+    verifier = await _seeded_top_up_verifier(rpc, state)
+    await verifier(payload)
+    assert rpc.reads == 3
+
+
+@pytest.mark.usefixtures("_no_sleep")
+async def test_top_up_verifier_refuses_a_read_that_never_reaches_the_status_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("solana_pay_kit.protocols.mpp.server.session_onchain._SLOT_PINNED_READ_TIMEOUT_SECONDS", 0.0)
+    payload, state, account = _top_up_scenario(deposit_after=1_250)
+    rpc = _MainnetLikeRpc(account=account, status=_LANDED_CLEAN, context_slots=[90])
+    verifier = await _seeded_top_up_verifier(rpc, state)
+    with pytest.raises(PaymentError, match="behind transaction slot"):
+        await verifier(payload)
+
+
+async def test_top_up_verifier_refuses_a_finalized_status_without_a_slot() -> None:
+    payload, state, account = _top_up_scenario(deposit_after=1_250)
+    rpc = _MainnetLikeRpc(account=account, status={"err": None, "confirmationStatus": "finalized"})
+    verifier = await _seeded_top_up_verifier(rpc, state)
+    with pytest.raises(PaymentError, match="no slot"):
+        await verifier(payload)
+
+
+async def test_top_up_verifier_credits_alongside_a_concurrent_top_up() -> None:
+    # Another top-up landed in the same window: the finalized deposit exceeds
+    # this top-up's expectation and must still verify.
+    payload, state, account = _top_up_scenario(deposit_after=1_250 + 500)
+    rpc = _MainnetLikeRpc(account=account, status=_LANDED_CLEAN)
+    verifier = await _seeded_top_up_verifier(rpc, state)
+    await verifier(payload)
+
+
+async def test_top_up_verifier_rejects_a_deposit_below_the_top_up() -> None:
+    payload, state, account = _top_up_scenario(deposit_after=1_249)
+    rpc = _MainnetLikeRpc(account=account, status=_LANDED_CLEAN)
+    verifier = await _seeded_top_up_verifier(rpc, state)
+    with pytest.raises(PaymentError, match="deposit does not reflect"):
+        await verifier(payload)
+
+
+def _sponsored_top_up(payload: TopUpPayload, fee_payer_signature) -> TopUpPayload:
+    """The scenario's top-up with a separate fee payer at slot 0: the payer's
+    slot 1 is validly signed, slot 0 is set by ``fee_payer_signature``."""
+    from solders.message import to_bytes_versioned  # type: ignore[import-untyped]
+
+    from solana_pay_kit._paycore.solana import resolve_mint
+    from solana_pay_kit.protocols.mpp._paymentchannels import TopUpParams, build_top_up_instruction
+
+    payer = Keypair.from_seed(bytes([11] * 32))
+    fee_payer = Keypair.from_seed(bytes([15] * 32))
+    instruction = build_top_up_instruction(
+        TopUpParams(
+            payer=payer.pubkey(),
+            channel=Pubkey.from_string(payload.channel_id),
+            mint=Pubkey.from_string(resolve_mint("USDC", "mainnet")),
+            amount=int(payload.additional_amount),
+            token_program=Pubkey.from_string(TOKEN_PROGRAM),
+            program_id=PROGRAM_ID,
+        )
+    )
+    message = MessageV0.try_compile(fee_payer.pubkey(), [instruction], [], Hash.default())
+    assert list(message.account_keys[:2]) == [fee_payer.pubkey(), payer.pubkey()]
+    signed = bytes(to_bytes_versioned(message))
+    signatures = [fee_payer_signature(fee_payer, signed), payer.sign_message(signed)]
+    transaction = VersionedTransaction.populate(message, signatures)
+    return TopUpPayload(payload.channel_id, payload.additional_amount, base64.b64encode(bytes(transaction)).decode())
+
+
+async def test_top_up_verifier_refuses_an_unverified_fee_payer_signature_before_sending() -> None:
+    # The payer's own signature verifies, but slot 0 (the signature the
+    # rescue path resolves a failed broadcast on) is a copy from elsewhere.
+    payload, state, account = _top_up_scenario(deposit_after=1_250)
+    forged = _sponsored_top_up(payload, lambda _kp, _msg: Signature(bytes([7]) * 64))
+    rpc = _MainnetLikeRpc(account=account, status=_LANDED_CLEAN)
+    verifier = await _seeded_top_up_verifier(rpc, state)
+    with pytest.raises(PaymentError, match="signature verification failed"):
+        await verifier(forged)
+    assert rpc.sent == []
+
+
+async def test_top_up_verifier_accepts_a_fully_signed_sponsored_top_up() -> None:
+    # Positive control: the same top-up with the fee payer's real signature.
+    payload, state, account = _top_up_scenario(deposit_after=1_250)
+    signed = _sponsored_top_up(payload, lambda kp, msg: kp.sign_message(msg))
+    rpc = _MainnetLikeRpc(account=account, status=_LANDED_CLEAN)
+    verifier = await _seeded_top_up_verifier(rpc, state)
+    await verifier(signed)
+    assert len(rpc.sent) == 1

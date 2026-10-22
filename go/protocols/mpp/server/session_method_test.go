@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -22,6 +23,7 @@ import (
 	"github.com/gagliardetto/solana-go/rpc"
 
 	"github.com/solana-foundation/pay-kit/go/internal/testutil"
+	"github.com/solana-foundation/pay-kit/go/paycore"
 	"github.com/solana-foundation/pay-kit/go/paycore/paymentchannels"
 	"github.com/solana-foundation/pay-kit/go/paycore/solanatx"
 	core "github.com/solana-foundation/pay-kit/go/protocols/mpp/core"
@@ -184,7 +186,7 @@ func TestNewSessionDefaults(t *testing.T) {
 		o.Network = ""
 		o.OpenTxSubmitter = ""
 	})
-	if session.currency != "USDC" || session.network != "mainnet" {
+	if session.currency != paycore.USDCMainnetMint || session.network != "mainnet" {
 		t.Fatalf("defaults: currency=%q network=%q", session.currency, session.network)
 	}
 	if session.openTxSubmitter != OpenTxSubmitterClient {
@@ -219,7 +221,7 @@ func TestSessionChallengeCanonicalShape(t *testing.T) {
 	if err := challenge.Request.Decode(&request); err != nil {
 		t.Fatalf("decode request: %v", err)
 	}
-	if request.Cap != "1000000" || request.Currency != "USDC" {
+	if request.Cap != "1000000" || request.Currency != paycore.ResolveMint("USDC", "localnet") {
 		t.Fatalf("cap=%q currency=%q", request.Cap, request.Currency)
 	}
 	if request.Operator != sessionTestRecipient || request.Recipient != sessionTestRecipient {
@@ -593,6 +595,26 @@ func TestSessionVoucherAdvancesWatermark(t *testing.T) {
 	}
 }
 
+func TestSessionVoucherExactReplayRejectedWithoutStateChange(t *testing.T) {
+	session := newTestSession(t, nil)
+	signer, channelID := openTrustedChannel(t, session, 1_000)
+	voucher := signer.SignVoucher(t, channelID, 250, farFuture())
+	action := intents.NewVoucherAction(intents.VoucherPayload{Voucher: voucher})
+	if _, err := verifySessionAction(t, session, action); err != nil {
+		t.Fatalf("voucher: %v", err)
+	}
+	before := mustGetChannel(t, session, channelID)
+	if _, err := verifySessionAction(t, session, action); err == nil || !strings.Contains(err.Error(), "already accepted") {
+		t.Fatalf("replay error = %v, want already-accepted rejection", err)
+	}
+	if after := mustGetChannel(t, session, channelID); !reflect.DeepEqual(after, before) {
+		t.Fatalf("replay changed state: %+v -> %+v", before, after)
+	}
+	if _, err := submitMethodVoucher(t, session, signer, channelID, 500); err != nil {
+		t.Fatalf("fresh voucher after replay: %v", err)
+	}
+}
+
 func TestSessionVoucherUnknownChannelRejected(t *testing.T) {
 	session := newTestSession(t, nil)
 	signer := newTestVoucherSigner(t)
@@ -931,7 +953,7 @@ func TestSessionCommitForReservedDelivery(t *testing.T) {
 	if directive.DeliveryID != channelID+":1" || directive.Sequence != 1 {
 		t.Fatalf("directive = %+v", directive)
 	}
-	if directive.Currency != "USDC" || directive.Amount != "200" {
+	if directive.Currency != paycore.ResolveMint("USDC", "localnet") || directive.Amount != "200" {
 		t.Fatalf("directive fields = %+v", directive)
 	}
 

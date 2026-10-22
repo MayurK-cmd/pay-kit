@@ -26,6 +26,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
+from solana_keychain import SolanaSigner
 from solders.pubkey import Pubkey  # type: ignore[import-untyped]
 
 from solana_pay_kit._paycore.mints import resolve_stablecoin_mint
@@ -193,7 +194,7 @@ class SessionConfig:
     voucher_signer: SessionVoucherSigner = "client"
 
     # Signing key used to issue cumulative vouchers for operator-mode use.
-    operator_signer: Any | None = None
+    operator_signer: SolanaSigner | None = None
 
     # Inactivity thresholds offered for a new channel.
     idle_timeout_options_seconds: list[int] | None = None
@@ -653,7 +654,7 @@ class SessionServer:
 
         result: list[SignedVoucher] = []
 
-        def mutator(current: ChannelState | None) -> ChannelState:
+        async def mutator(current: ChannelState | None) -> ChannelState:
             if current is None:
                 raise ValueError(f"channel {payload.channel_id} not found")
             if current.sealed or current.close_requested_at is not None:
@@ -697,7 +698,7 @@ class SessionServer:
             )
             signer = self._config.operator_signer
             assert signer is not None
-            signature = str(signer.sign_message(data.message_bytes()))
+            signature = str(await signer.sign_message(data.message_bytes()))
             voucher = SignedVoucher(
                 data=data,
                 signer=current.authorized_signer,
@@ -730,7 +731,8 @@ class SessionServer:
         The full ordered check sequence runs as a preflight outside the store
         lock (see :func:`verify_voucher_for_channel`), then the state-dependent
         checks are re-applied inside the atomic mutator before the watermark is
-        persisted.
+        persisted. An exact replay of the highest voucher is rejected without
+        changing state: each voucher authorizes one request.
         """
         voucher = payload.voucher
         # The top-level channelId is the routing key; it must never diverge
@@ -781,17 +783,13 @@ class SessionServer:
                 raise ValueError(f"channel {channel_id} is already sealed")
             if current.close_requested_at is not None:
                 raise ValueError(f"channel {channel_id} close is pending; no further vouchers accepted")
-            replayed = result.status == VoucherVerifyStatus.REPLAYED and new_cumulative == current.cumulative
+            if result.status == VoucherVerifyStatus.REPLAYED:
+                # Each voucher authorizes one request; a replay changes no state.
+                raise ValueError("voucher was already accepted; sign a new voucher for this request")
             # Concurrent watermark advancement check.
-            if not replayed and new_cumulative <= current.cumulative:
+            if new_cumulative <= current.cumulative:
                 raise ValueError("concurrent update: watermark advanced")
             nxt = current.clone()
-            if replayed:
-                # An idempotent replay of the already-accepted highest voucher
-                # must not deliver additional service or debit spent_amount
-                # again — the client already paid for it.
-                nxt.last_activity_at = int(time.time() * 1000)
-                return nxt
             if new_cumulative - current.spent_amount < price:
                 raise ValueError("insufficient authorized voucher availability")
             nxt.cumulative = new_cumulative

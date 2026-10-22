@@ -46,6 +46,9 @@ func New(cfg paykit.Config) (paykit.Adapter, error) {
 	if len(cfg.MPP.ChallengeBindingSecret) == 0 {
 		return nil, fmt.Errorf("protocols/mpp: MPP.ChallengeBindingSecret is required")
 	}
+	if cfg.MPP.Store == nil {
+		return nil, fmt.Errorf("protocols/mpp: MPP.Store is required")
+	}
 	return &Adapter{cfg: cfg}, nil
 }
 
@@ -135,7 +138,11 @@ func (a *Adapter) VerifyAndSettle(req *paykit.AdapterRequest) (*paykit.Payment, 
 	}
 	receipt, err := srv.VerifyCredentialWithExpected(context.Background(), credential, expected)
 	if err != nil {
-		return nil, &paykit.PaymentError{Code: "invalid_proof", Err: err, Gate: req.Gate}
+		code := "invalid_proof"
+		if server.IsSettlementInProgress(err) {
+			code = paykit.CodeSettlementInProgress
+		}
+		return nil, &paykit.PaymentError{Code: code, Err: err, Gate: req.Gate}
 	}
 	receiptHeader, err := core.FormatReceipt(receipt)
 	headers := map[string]string{}
@@ -168,7 +175,7 @@ func (a *Adapter) serverFor(gate *paykit.Gate) (*server.Mpp, error) {
 	if a.cfg.Operator.FeePayer && a.cfg.Operator.Signer != nil {
 		feePayer = &signerBridge{signer: a.cfg.Operator.Signer}
 	}
-	srv, err := server.New(server.Config{
+	srv, err := server.New(a.cfg.MPP.Store, server.Config{
 		Recipient:      string(payTo),
 		SecretKey:      string(a.cfg.MPP.ChallengeBindingSecret),
 		Currency:       coin,

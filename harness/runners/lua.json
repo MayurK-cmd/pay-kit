@@ -1,5 +1,13 @@
 {
   "language": "lua",
-  "command": ["luajit", "cmd/conformance/main.lua"],
+  "command": [
+    "luajit",
+    "cmd/conformance/main.lua"
+  ],
+  "serve": [
+    "luajit",
+    "cmd/conformance/main.lua",
+    "--serve"
+  ],
   "cwd": "lua"
 }

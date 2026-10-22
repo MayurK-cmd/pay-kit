@@ -36,12 +36,13 @@ final class AtaCreateRejectTest extends TestCase
     /**
      * Assemble the always-present prefix (compute limit/price + transfer)
      * plus the supplied optional instructions into a base64 wire tx, and
-     * return [base64, requirement].
+     * return [base64, requirement, facilitator]. The facilitator is the fee
+     * payer and the only signer, so its slot is left for it to co-sign.
      *
      * @param list<array{program:string,data:string,accounts:list<string>}> $optionals
-     * @return array{0:string,1:array<string,mixed>}
+     * @return array{0:string,1:array<string,mixed>,2:string}
      */
-    private function buildTransaction(array $optionals): array
+    private function buildTransaction(array $optionals, ?string $transferDataOverride = null): array
     {
         $payer     = Keypair::generate()->getPublicKey()->toBase58();
         $authority = Keypair::generate()->getPublicKey()->toBase58();
@@ -55,7 +56,7 @@ final class AtaCreateRejectTest extends TestCase
         // Instruction data blobs.
         $computeLimitData = chr(2) . pack('V', 200000);            // tag 2 + u32
         $computePriceData = chr(3) . pack('P', 1);                 // tag 3 + u64
-        $transferData     = chr(12) . pack('P', $amount) . chr(6); // tag 12 + u64 + u8 decimals
+        $transferData     = $transferDataOverride ?? chr(12) . pack('P', $amount) . chr(6); // tag 12 + u64 + u8 decimals
 
         // Build the ordered account-key table and an index resolver.
         $keys = [];
@@ -122,13 +123,13 @@ final class AtaCreateRejectTest extends TestCase
             'extra'  => ['tokenProgram' => $tokenProgram, 'memo' => ''],
         ];
 
-        return [base64_encode($wire), $requirement];
+        return [base64_encode($wire), $requirement, $payer];
     }
 
     public function testTransactionWithoutOptionalsVerifies(): void
     {
-        [$tx, $req] = $this->buildTransaction([]);
-        $result = Verifier::verify($tx, $req, ['someFacilitatorPubkeyThatIsNotInTx']);
+        [$tx, $req, $facilitator] = $this->buildTransaction([]);
+        $result = Verifier::verify($tx, $req, [$facilitator]);
         $this->assertSame(self::TOKEN_PROGRAM, $result['program']);
         $this->assertSame(100000, $result['amount']);
         $this->assertArrayNotHasKey('destinationCreateAta', $result);
@@ -138,20 +139,20 @@ final class AtaCreateRejectTest extends TestCase
     {
         // Wallets (Phantom 1, Solflare 2) inject Lighthouse guard
         // instructions; the verifier MUST allow them in optional slots.
-        [$tx, $req] = $this->buildTransaction([
+        [$tx, $req, $facilitator] = $this->buildTransaction([
             ['program' => self::LIGHTHOUSE, 'data' => chr(0), 'accounts' => []],
             ['program' => self::LIGHTHOUSE, 'data' => chr(0), 'accounts' => []],
         ]);
-        $result = Verifier::verify($tx, $req, ['someFacilitatorPubkeyThatIsNotInTx']);
+        $result = Verifier::verify($tx, $req, [$facilitator]);
         $this->assertSame(100000, $result['amount']);
     }
 
     public function testMemoOptionalInstructionAccepted(): void
     {
-        [$tx, $req] = $this->buildTransaction([
+        [$tx, $req, $facilitator] = $this->buildTransaction([
             ['program' => self::MEMO_PROGRAM, 'data' => 'abc123nonce', 'accounts' => []],
         ]);
-        $result = Verifier::verify($tx, $req, ['someFacilitatorPubkeyThatIsNotInTx']);
+        $result = Verifier::verify($tx, $req, [$facilitator]);
         $this->assertSame(100000, $result['amount']);
     }
 
@@ -163,20 +164,90 @@ final class AtaCreateRejectTest extends TestCase
         // seller-pinned extra.tokenProgram. An offer that omits it must still
         // verify a real Token-program transfer rather than rejecting with
         // missing_extra_tokenProgram.
-        [$tx, $req] = $this->buildTransaction([]);
+        [$tx, $req, $facilitator] = $this->buildTransaction([]);
         unset($req['extra']['tokenProgram']);
 
-        $result = Verifier::verify($tx, $req, ['someFacilitatorPubkeyThatIsNotInTx']);
+        $result = Verifier::verify($tx, $req, [$facilitator]);
 
         $this->assertSame(self::TOKEN_PROGRAM, $result['program']);
         $this->assertSame(100000, $result['amount']);
+    }
+
+    /**
+     * scheme_exact_svm §2.1.1 / RULINGS S3: the managed fee payer must stay
+     * out of EVERY instruction's accounts, not only the transfer's. The same
+     * transaction verifies when the key is not managed (positive control).
+     */
+    public function testManagedSignerInOptionalInstructionRejected(): void
+    {
+        $sponsor = Keypair::generate()->getPublicKey()->toBase58();
+        foreach ([self::MEMO_PROGRAM, self::LIGHTHOUSE] as $program) {
+            [$tx, $req, $facilitator] = $this->buildTransaction([
+                ['program' => $program, 'data' => 'x', 'accounts' => [$sponsor]],
+            ]);
+            $result = Verifier::verify($tx, $req, [$facilitator]);
+            $this->assertSame(100000, $result['amount']);
+
+            try {
+                Verifier::verify($tx, $req, [$sponsor]);
+                $this->fail('expected the sponsor-in-' . $program . ' transaction to be rejected');
+            } catch (InvalidProofException $e) {
+                $this->assertStringContainsString('fee_payer_in_instruction_accounts', $e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * scheme_exact_svm §1.4: the matching transfer is "at least" the
+     * required amount. The 100000 transfer pays a 99999 requirement
+     * (overpayment, accepted) and its own amount (control), but not 100001.
+     */
+    public function testTransferMayOverpayButNotUnderpay(): void
+    {
+        [$tx, $req, $facilitator] = $this->buildTransaction([]);
+        foreach (['99999', '100000'] as $required) {
+            $req['amount'] = $required;
+            $this->assertSame(100000, Verifier::verify($tx, $req, [$facilitator])['amount']);
+        }
+
+        $req['amount'] = '100001';
+        $this->expectException(InvalidProofException::class);
+        $this->expectExceptionMessageMatches('/amount_mismatch/');
+        Verifier::verify($tx, $req, [$facilitator]);
+    }
+
+    /** §1.4: exactly one matching transfer; a second TransferChecked is rejected. */
+    public function testSecondTransferCheckedRejected(): void
+    {
+        [$tx, $req, $facilitator] = $this->buildTransaction([[
+            'program'  => self::TOKEN_PROGRAM,
+            'data'     => chr(12) . pack('P', 100000) . chr(6),
+            'accounts' => [
+                Keypair::generate()->getPublicKey()->toBase58(),
+                self::USDC_MINT,
+                Keypair::generate()->getPublicKey()->toBase58(),
+                Keypair::generate()->getPublicKey()->toBase58(),
+            ],
+        ]]);
+        $this->expectException(InvalidProofException::class);
+        $this->expectExceptionMessageMatches('/unknown_fourth_instruction/');
+        Verifier::verify($tx, $req, [$facilitator]);
+    }
+
+    /** §1.4: zero matching transfers (ix[2] is a plain Transfer) is rejected. */
+    public function testNoTransferCheckedRejected(): void
+    {
+        [$tx, $req, $facilitator] = $this->buildTransaction([], chr(3) . pack('P', 100000));
+        $this->expectException(InvalidProofException::class);
+        $this->expectExceptionMessageMatches('/no_transfer_instruction/');
+        Verifier::verify($tx, $req, [$facilitator]);
     }
 
     public function testAtaCreateOptionalInstructionRejected(): void
     {
         // An Associated-Token-Program create instruction must NOT be an
         // allowed optional slot. The destination ATA must pre-exist.
-        [$tx, $req] = $this->buildTransaction([
+        [$tx, $req, $facilitator] = $this->buildTransaction([
             [
                 'program'  => self::ATA_PROGRAM,
                 'data'     => chr(1), // idempotent-create discriminator
@@ -192,6 +263,6 @@ final class AtaCreateRejectTest extends TestCase
         ]);
         $this->expectException(InvalidProofException::class);
         $this->expectExceptionMessageMatches('/unknown_fourth_instruction/');
-        Verifier::verify($tx, $req, ['someFacilitatorPubkeyThatIsNotInTx']);
+        Verifier::verify($tx, $req, [$facilitator]);
     }
 }

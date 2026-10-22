@@ -158,7 +158,8 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12.28", features = ["json", "stream"] }
 
 # Axum extractor / unified gate (opt-in).
-axum = { version = "0.8", optional = true, default-features = false }
+# `json` renders the 402 hint body; `original-uri` keeps nested routes' public path.
+axum = { version = "0.8", optional = true, default-features = false, features = ["json", "original-uri"] }
 rmcp = { version = "3.5", optional = true, default-features = false }
 
 # Serialization
@@ -207,11 +208,14 @@ thiserror = "2"
 # litesvm 0.16 shares the kit's solana-address pins, so it can be a plain
 # dev-dependency; it executes version-1 transactions and the ZK ElGamal Proof
 # program, which the `litesvm-tests` confidential tests rely on.
-litesvm = "0.16"
+litesvm = { version = "0.16", features = ["precompiles"] }
+solana-account = "4"
 tokio = { version = "1", features = ["full"] }
 rmcp = { version = "3.5", default-features = false, features = ["client", "server"] }
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
+# Hand-rolled lazy response bodies in the gate tests (already in the tree via axum).
+http-body = "1"
 serde_json = "1"
 ed25519-dalek = "2"
 base64 = "0.22"
@@ -236,6 +240,10 @@ name = "axum_batch"
 required-features = ["axum"]
 
 [[example]]
+name = "vector_runner"
+required-features = ["mpp", "x402", "client", "server", "testkit"]
+
+[[example]]
 name = "golden_tx"
 required-features = ["mpp", "client"]
 
@@ -250,3 +258,7 @@ required-features = ["mpp"]
 [[test]]
 name = "kotlin_golden_vector"
 required-features = ["x402"]
+
+[[test]]
+name = "gate_paid_requests"
+required-features = ["axum", "client"]

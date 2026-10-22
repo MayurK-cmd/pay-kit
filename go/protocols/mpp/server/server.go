@@ -24,7 +24,6 @@ import (
 
 const (
 	secretKeyEnvVar = "MPP_SECRET_KEY"
-	consumedPrefix  = "solana-charge:consumed:"
 
 	// minSecretKeyBytes is the minimum length of the HMAC-SHA256 secret
 	// that binds challenge IDs. 32 bytes matches NIST SP 800-107 guidance
@@ -71,7 +70,6 @@ type Config struct {
 	Realm          string
 	HTML           bool
 	FeePayerSigner solanatx.Signer
-	Store          core.Store
 	RPC            solanatx.RPCClient
 
 	// AcceptPushMode opts in to accepting type="signature" (push mode)
@@ -116,8 +114,13 @@ type Mpp struct {
 	acceptPushMode bool
 }
 
-// New creates a new server-side handler.
-func New(config Config) (*Mpp, error) {
+// New creates a server-side handler. store is the replay store and is
+// required: pass one long-lived Store shared by every verifier of the same
+// challenges.
+func New(store core.Store, config Config) (*Mpp, error) {
+	if store == nil {
+		return nil, core.NewError(core.ErrCodeInvalidConfig, "store is required: pass one long-lived Store shared by every verifier of the same challenges")
+	}
 	if strings.TrimSpace(config.Recipient) == "" {
 		return nil, core.NewError(core.ErrCodeInvalidConfig, "recipient is required")
 	}
@@ -143,9 +146,6 @@ func New(config Config) (*Mpp, error) {
 	if config.Currency == "" {
 		config.Currency = "USDC"
 	}
-	if config.Decimals == 0 {
-		config.Decimals = 6
-	}
 	if config.Network == "" {
 		config.Network = string(paycore.NetworkMainnet)
 	}
@@ -169,60 +169,92 @@ func New(config Config) (*Mpp, error) {
 	if config.RPC == nil {
 		config.RPC = rpc.New(rpcURL)
 	}
-	if config.Store == nil {
-		config.Store = core.NewMemoryStore()
-	}
 	// Resolve the token program once at boot. Known stablecoins answer from
 	// the static table; an arbitrary mint address is looked up on-chain and
 	// rejected if its owner is neither Token nor Token-2022. Native SOL has no
 	// token program. Mirrors the Rust reference resolve_server_token_program.
-	tokenProgram, err := resolveServerTokenProgram(context.Background(), config.RPC, config.Currency, config.Network)
+	asset, err := resolveServerAsset(context.Background(), config.RPC, config.Currency, config.Network)
 	if err != nil {
 		return nil, err
+	}
+	tokenProgram, decimals := asset.tokenProgram, asset.decimals
+	// Config.Decimals is optional and only cross-checked: the authoritative
+	// value comes from the asset itself, so a 0-decimal mint is
+	// representable and a mint is never silently assumed to have 6.
+	if config.Decimals != 0 && config.Decimals != decimals {
+		return nil, core.NewError(core.ErrCodeInvalidConfig,
+			fmt.Sprintf("configured decimals %d do not match %s decimals %d", config.Decimals, config.Currency, decimals))
 	}
 	return &Mpp{
 		rpc:            config.RPC,
 		secretKey:      config.SecretKey,
 		realm:          config.Realm,
 		recipient:      recipient,
-		currency:       config.Currency,
-		decimals:       config.Decimals,
+		currency:       asset.currency,
+		decimals:       decimals,
 		network:        config.Network,
 		rpcURL:         rpcURL,
 		html:           config.HTML,
 		feePayerSigner: config.FeePayerSigner,
-		store:          config.Store,
+		store:          store,
 		tokenProgram:   tokenProgram,
 		acceptPushMode: config.AcceptPushMode,
 	}, nil
 }
 
-// resolveServerTokenProgram pins the SPL token program for the server's
-// configured currency at boot. SOL has no token program (returns ""). A known
-// stablecoin symbol or mint answers from the static table. An arbitrary mint
-// address is resolved by fetching its on-chain owner; the owner MUST be the
-// Token or Token-2022 program or boot fails. This stops the SDK from silently
-// defaulting an arbitrary Token-2022 mint to legacy Token. Mirrors the Rust
-// reference's resolve_server_token_program in Mpp::new.
-func resolveServerTokenProgram(ctx context.Context, rpcClient solanatx.RPCClient, currency, network string) (string, error) {
+// nativeSOLDecimals is the lamports-per-SOL exponent used to convert a
+// human SOL price into lamports.
+const nativeSOLDecimals uint8 = 9
+
+// serverAsset is a configured currency resolved once at boot into what
+// goes on the wire.
+type serverAsset struct {
+	// currency is the wire currency: "sol" or a base58 mint address, never
+	// a symbol (RULINGS C1).
+	currency string
+	// tokenProgram is the owning token program; empty for SOL.
+	tokenProgram string
+	// decimals is the asset's decimals (9 for SOL lamports).
+	decimals uint8
+}
+
+// resolveServerAsset resolves the server's configured currency at boot. SOL
+// becomes "sol" with no token program and 9 decimals (lamports). A known
+// stablecoin symbol is resolved to its mint for the network and answers
+// token program and decimals from the static table. An arbitrary mint
+// address is resolved by fetching the mint account: its owner MUST be the
+// Token or Token-2022 program and its decimals come from the account data,
+// or boot fails. This keeps symbols off the wire and stops the SDK from
+// silently defaulting an arbitrary Token-2022 mint to legacy Token or an
+// arbitrary mint to 6 decimals. Mirrors the Rust reference's
+// resolve_server_token_program in Mpp::new.
+func resolveServerAsset(ctx context.Context, rpcClient solanatx.RPCClient, currency, network string) (serverAsset, error) {
 	if isNativeSOL(currency) {
-		return "", nil
+		return serverAsset{currency: "sol", decimals: nativeSOLDecimals}, nil
 	}
 	if paycore.StablecoinSymbol(currency) != "" {
-		return paycore.DefaultTokenProgramForCurrency(currency, network), nil
+		return serverAsset{
+			currency:     paycore.ResolveMint(currency, network),
+			tokenProgram: paycore.DefaultTokenProgramForCurrency(currency, network),
+			decimals:     paycore.StablecoinDecimals,
+		}, nil
 	}
-	// Arbitrary mint address: parse it and fetch the on-chain owner.
+	// Arbitrary mint address: parse it and read the on-chain mint.
 	mint, err := solana.PublicKeyFromBase58(currency)
 	if err != nil {
-		return "", core.WrapError(core.ErrCodeInvalidConfig,
-			"currency must be a known stablecoin symbol or a valid SPL mint address", err)
+		return serverAsset{}, core.WrapError(core.ErrCodeInvalidConfig,
+			"currency must be \"sol\", a known stablecoin symbol or a valid SPL mint address", err)
 	}
-	program, err := solanatx.ResolveTokenProgram(ctx, rpcClient, mint, "")
+	if rpcClient == nil {
+		return serverAsset{}, core.NewError(core.ErrCodeInvalidConfig,
+			fmt.Sprintf("an RPC client is required to read the token program and decimals of mint %s", mint))
+	}
+	info, err := solanatx.FetchMint(ctx, rpcClient, mint)
 	if err != nil {
-		return "", core.WrapError(core.ErrCodeInvalidConfig,
-			"could not resolve token program for mint (owner must be Token or Token-2022)", err)
+		return serverAsset{}, core.WrapError(core.ErrCodeInvalidConfig,
+			"could not resolve mint (owner must be Token or Token-2022)", err)
 	}
-	return program.String(), nil
+	return serverAsset{currency: mint.String(), tokenProgram: info.TokenProgram.String(), decimals: info.Decimals}, nil
 }
 
 // Charge creates a charge challenge from a human-readable amount.
@@ -276,11 +308,10 @@ func (m *Mpp) validateChargeOptions(options ChargeOptions) error {
 	if isNativeSOL(m.currency) {
 		return core.NewError(core.ErrCodeInvalidPayload, "ataCreationRequired requires an SPL token currency")
 	}
-	// resolve_stablecoin_mint(currency) == currency means the currency is
-	// already a raw mint address (symbols resolve to a different mint).
-	if paycore.ResolveMint(m.currency, m.network) != m.currency {
-		return core.NewError(core.ErrCodeInvalidPayload, "ataCreationRequired requires currency to be an SPL token mint address")
-	}
+	// m.currency is the issued wire currency, which New() already resolved
+	// from any configured symbol to a mint address (RULINGS C1), so the
+	// challenge always names the mint the ATA is created for. Re-check it
+	// parses so the invariant is enforced here, not assumed.
 	if _, err := solana.PublicKeyFromBase58(m.currency); err != nil {
 		return core.NewError(core.ErrCodeInvalidPayload, fmt.Sprintf("ataCreationRequired requires a valid SPL token mint address: %v", err))
 	}
@@ -408,29 +439,25 @@ func (m *Mpp) VerifyCredentialWithExpected(
 	credential core.PaymentCredential,
 	expected intents.ChargeRequest,
 ) (core.Receipt, error) {
-	credRequest, _, payload, err := m.verifyChallengeAndDecode(credential)
+	credRequest, _, payload, expired, err := m.verifyChallengeAndDecode(credential)
 	if err != nil {
 		return core.Receipt{}, err
 	}
-	if credRequest.Amount != expected.Amount {
-		return core.Receipt{}, core.NewError(
-			core.ErrCodeAmountMismatch,
-			fmt.Sprintf("amount mismatch: credential has %s but endpoint expects %s",
-				credRequest.Amount, expected.Amount),
-		)
+	if expired != nil {
+		// An expired challenge never starts a payment. It may only finish
+		// one this same challenge already broadcast and left pending, so a
+		// retry after a lost response still reconciles.
+		if err := checkExpected(credRequest, expected); err != nil {
+			return core.Receipt{}, expired
+		}
+		expectedDetails, err := decodeMethodDetails(expected.MethodDetails)
+		if err != nil {
+			return core.Receipt{}, expired
+		}
+		return m.reconcileExpired(ctx, credential, expected, expectedDetails, payload, expired)
 	}
-	if credRequest.Currency != expected.Currency {
-		return core.Receipt{}, core.NewError(
-			core.ErrCodeChallengeRouteMismatch,
-			fmt.Sprintf("currency mismatch: credential has %s but endpoint expects %s",
-				credRequest.Currency, expected.Currency),
-		)
-	}
-	if credRequest.Recipient != expected.Recipient {
-		return core.Receipt{}, core.NewError(
-			core.ErrCodeRecipientMismatch,
-			"recipient mismatch: credential was issued for a different recipient",
-		)
+	if err := checkExpected(credRequest, expected); err != nil {
+		return core.Receipt{}, err
 	}
 	expectedDetails, err := decodeMethodDetails(expected.MethodDetails)
 	if err != nil {
@@ -439,12 +466,85 @@ func (m *Mpp) VerifyCredentialWithExpected(
 	return m.verifyPayload(ctx, credential, expected, expectedDetails, payload)
 }
 
+// checkExpected binds the credential's charge to the route's expected one.
+func checkExpected(credRequest, expected intents.ChargeRequest) error {
+	if credRequest.Amount != expected.Amount {
+		return core.NewError(
+			core.ErrCodeAmountMismatch,
+			fmt.Sprintf("amount mismatch: credential has %s but endpoint expects %s",
+				credRequest.Amount, expected.Amount),
+		)
+	}
+	if credRequest.Currency != expected.Currency {
+		return core.NewError(
+			core.ErrCodeChallengeRouteMismatch,
+			fmt.Sprintf("currency mismatch: credential has %s but endpoint expects %s",
+				credRequest.Currency, expected.Currency),
+		)
+	}
+	if credRequest.Recipient != expected.Recipient {
+		return core.NewError(
+			core.ErrCodeRecipientMismatch,
+			"recipient mismatch: credential was issued for a different recipient",
+		)
+	}
+	return nil
+}
+
+// reconcileExpired reconciles the pending charge an expired credential left
+// behind, or refuses it as expired. Only a pull credential whose transaction
+// (as this server co-signs it) is recorded pending under this same challenge
+// gets past here; it is then settled from the chain only, never broadcast.
+func (m *Mpp) reconcileExpired(
+	ctx context.Context,
+	credential core.PaymentCredential,
+	request intents.ChargeRequest,
+	details paycore.MethodDetails,
+	payload paycore.CredentialPayload,
+	expired error,
+) (core.Receipt, error) {
+	if payload.Type != "transaction" || payload.Transaction == "" {
+		return core.Receipt{}, expired
+	}
+	tx, err := decodeCredentialTransaction(payload.Transaction)
+	if err != nil {
+		return core.Receipt{}, expired
+	}
+	if m.feePayerSigner != nil {
+		if err := solanatx.SignTransaction(tx, m.feePayerSigner); err != nil {
+			return core.Receipt{}, expired
+		}
+	}
+	signature, err := solanatx.VerifiedSignature(tx)
+	if err != nil {
+		return core.Receipt{}, expired
+	}
+	raw, ok, err := m.store.Get(ctx, pendingChargePrefix+signature.String())
+	if err != nil {
+		return core.Receipt{}, err
+	}
+	var record pendingCharge
+	if !ok || json.Unmarshal(raw, &record) != nil || record.ChallengeID != credential.Challenge.ID {
+		return core.Receipt{}, expired
+	}
+	return m.reconcilePending(ctx, credential, request, details, signature)
+}
+
+// now is the clock challenge expiry is judged against; tests move it.
+var now = time.Now
+
 // verifyChallengeAndDecode runs Tier-1 (HMAC + expiry) and Tier-2 (pinned-field
 // backstop) checks, then returns the credential-decoded request, method
 // details, and payload for downstream settlement.
+//
+// An expired challenge is not an error here: it comes back as the expiry
+// error in its own result, alongside everything else, so the caller can
+// reconcile a charge that challenge already left pending. The caller must
+// never start a payment for it. Any other failure on an expired challenge
+// reports the expiry, as it always has.
 func (m *Mpp) verifyChallengeAndDecode(
 	credential core.PaymentCredential,
-) (intents.ChargeRequest, paycore.MethodDetails, paycore.CredentialPayload, error) {
+) (request intents.ChargeRequest, details paycore.MethodDetails, payload paycore.CredentialPayload, expired error, err error) {
 	challenge := core.PaymentChallenge{
 		ID:      credential.Challenge.ID,
 		Realm:   credential.Challenge.Realm,
@@ -456,29 +556,32 @@ func (m *Mpp) verifyChallengeAndDecode(
 		Opaque:  credential.Challenge.Opaque,
 	}
 	if !challenge.Verify(m.secretKey) {
-		return intents.ChargeRequest{}, paycore.MethodDetails{}, paycore.CredentialPayload{},
+		return request, details, payload, nil,
 			core.NewError(core.ErrCodeChallengeMismatch, "challenge ID mismatch")
 	}
-	if challenge.IsExpired(time.Now()) {
-		return intents.ChargeRequest{}, paycore.MethodDetails{}, paycore.CredentialPayload{},
-			core.NewError(core.ErrCodeChallengeExpired, fmt.Sprintf("challenge expired at %s", challenge.Expires))
+	if challenge.IsExpired(now()) {
+		expired = core.NewError(core.ErrCodeChallengeExpired, fmt.Sprintf("challenge expired at %s", challenge.Expires))
 	}
-	var request intents.ChargeRequest
+	fail := func(err error) (intents.ChargeRequest, paycore.MethodDetails, paycore.CredentialPayload, error, error) {
+		if expired != nil {
+			err = expired
+		}
+		return intents.ChargeRequest{}, paycore.MethodDetails{}, paycore.CredentialPayload{}, nil, err
+	}
 	if err := challenge.Request.Decode(&request); err != nil {
-		return intents.ChargeRequest{}, paycore.MethodDetails{}, paycore.CredentialPayload{}, err
+		return fail(err)
 	}
 	if err := m.verifyPinnedFields(credential, request); err != nil {
-		return intents.ChargeRequest{}, paycore.MethodDetails{}, paycore.CredentialPayload{}, err
+		return fail(err)
 	}
-	details, err := decodeMethodDetails(request.MethodDetails)
+	details, err = decodeMethodDetails(request.MethodDetails)
 	if err != nil {
-		return intents.ChargeRequest{}, paycore.MethodDetails{}, paycore.CredentialPayload{}, err
+		return fail(err)
 	}
-	var payload paycore.CredentialPayload
 	if err := credential.PayloadAs(&payload); err != nil {
-		return intents.ChargeRequest{}, paycore.MethodDetails{}, paycore.CredentialPayload{}, err
+		return fail(err)
 	}
-	return request, details, payload, nil
+	return request, details, payload, expired, nil
 }
 
 // verifyPinnedFields is the Tier-2 backstop. After Tier-1 (HMAC) confirms the
@@ -616,6 +719,17 @@ func (m *Mpp) verifyTransaction(
 	if err := verifyTransfersAgainstChallenge(tx, amount, request.Currency, m.recipient, request.ExternalID, details); err != nil {
 		return core.Receipt{}, err
 	}
+	// The client's signatures must verify over this message before anything
+	// is co-signed, claimed or sent; only the server's own fee-payer slot
+	// (account zero, which it overwrites) is left unchecked.
+	var serverFeePayer *solana.PublicKey
+	if feeSponsored {
+		key := m.feePayerSigner.PublicKey()
+		serverFeePayer = &key
+	}
+	if err := verifyClientSignatures(tx, serverFeePayer); err != nil {
+		return core.Receipt{}, err
+	}
 	if m.feePayerSigner != nil {
 		if err := solanatx.SignTransaction(tx, m.feePayerSigner); err != nil {
 			return core.Receipt{}, err
@@ -624,28 +738,58 @@ func (m *Mpp) verifyTransaction(
 	if len(tx.Signatures) == 0 || tx.Signatures[0].IsZero() {
 		return core.Receipt{}, core.NewError(core.ErrCodeMissingSignature, "transaction is missing a primary signature")
 	}
-	consumedKey := consumedPrefix + tx.Signatures[0].String()
-	inserted, err := m.store.PutIfAbsent(ctx, consumedKey, true)
+	// Every signature must verify against the exact message before its
+	// signature is claimed, recorded pending or sent. Simulation's sigVerify
+	// runs only after the pending record is written, so a forged slot-0
+	// signature copied from a landed transaction would otherwise name this
+	// charge: a concurrent copy would reconcile on that other transaction's
+	// status. The claim key comes only from VerifiedSignature; a refusal
+	// here claims and sends nothing.
+	primary, err := solanatx.VerifiedSignature(tx)
+	if err != nil {
+		return core.Receipt{}, core.WrapError(core.ErrCodeInvalidPayload, "verify transaction signatures", err)
+	}
+	finalSignature := primary.String()
+	inserted, err := m.consumed().Claim(ctx, finalSignature)
 	if err != nil {
 		return core.Receipt{}, err
 	}
 	if !inserted {
-		return core.Receipt{}, core.NewError(core.ErrCodeSignatureConsumed, "transaction signature already consumed")
+		return m.reconcilePending(ctx, credential, request, details, primary)
 	}
 	cleanupConsumed := true
+	pendingKey := pendingChargePrefix + finalSignature
 	defer func() {
 		if cleanupConsumed {
 			// Detach cancellation but keep trace/values so rollback still
 			// runs when the caller's context is already canceled.
-			_ = m.store.Delete(context.WithoutCancel(ctx), consumedKey)
+			_ = m.store.Delete(context.WithoutCancel(ctx), pendingKey)
+			_ = m.consumed().Release(context.WithoutCancel(ctx), finalSignature)
 		}
 	}()
+	// The pending record a retry reconciles is written with the claim, before
+	// anything is sent. Written after an ambiguous send, a store failure would
+	// leave a claim with no record, and every retry would refuse a payment
+	// that may have landed as consumed. Nothing is sent if it cannot be kept.
+	if err := m.store.Put(ctx, pendingKey, pendingCharge{ChallengeID: credential.Challenge.ID}); err != nil {
+		return core.Receipt{}, err
+	}
 	if err := solanatx.SimulateTransaction(ctx, m.rpc, tx); err != nil {
 		return core.Receipt{}, core.WrapError(core.ErrCodeSimulationFailed, "simulate transaction", err)
 	}
 	signature, err := solanatx.SendTransaction(ctx, m.rpc, tx)
 	if err != nil {
-		return core.Receipt{}, core.WrapError(core.ErrCodeRPC, "send transaction", err)
+		// Only a preflight rejection proves the node did not forward the
+		// transaction, so only then is the claim released for a retry.
+		if solanatx.IsPreflightRejection(err) {
+			return core.Receipt{}, core.WrapError(core.ErrCodeSimulationFailed, "send transaction", err)
+		}
+		// Any other send error (a lost response, a timeout, a 5xx from a
+		// proxy that already forwarded it) leaves the outcome unknown:
+		// keep the claim and record the locally derived signature as
+		// pending, so a fresh challenge is not paid while it can still land.
+		cleanupConsumed = false
+		return core.Receipt{}, settlementInProgress(finalSignature, err)
 	}
 	// The RPC accepted the broadcast. From here the transaction may land
 	// on-chain even if confirmation polling or the on-chain re-verification
@@ -655,13 +799,38 @@ func (m *Mpp) verifyTransaction(
 	// double-pays. Mirrors the rust reference, which consumes the signature
 	// after broadcast and never deletes it on a confirmation timeout.
 	cleanupConsumed = false
+	if !signature.Equals(tx.Signatures[0]) {
+		return core.Receipt{}, settlementInProgress(finalSignature,
+			fmt.Errorf("RPC reported signature %s for transaction %s", signature, finalSignature))
+	}
 	if err := solanatx.WaitForConfirmation(ctx, m.rpc, signature); err != nil {
+		if ctx.Err() != nil {
+			// Still unconfirmed when the request gave up: outcome unknown.
+			return core.Receipt{}, settlementInProgress(finalSignature, err)
+		}
 		return core.Receipt{}, core.WrapError(core.ErrCodeTransactionFailed, "confirm transaction", err)
 	}
 	if err := m.verifyOnChain(ctx, signature, request, details); err != nil {
 		return core.Receipt{}, err
 	}
+	// The pending record is visible to concurrent retries, which grant
+	// through the same single-winner token: only one presentation is granted.
+	granted, err := m.store.PutIfAbsent(ctx, resolvedChargePrefix+finalSignature, true)
+	if err != nil {
+		return core.Receipt{}, err
+	}
+	if !granted {
+		return core.Receipt{}, core.NewError(core.ErrCodeSignatureConsumed, "transaction signature already consumed")
+	}
+	_ = m.store.Delete(context.WithoutCancel(ctx), pendingKey)
 	return successReceipt(signature.String(), credential.Challenge.ID, request.ExternalID), nil
+}
+
+// consumed is the consumed-signature ledger shared with x402 exact, so a
+// payment settled through either protocol cannot authorize a second request
+// through the other on a gate sharing the store.
+func (m *Mpp) consumed() paycore.ConsumedSignatures {
+	return paycore.NewConsumedSignatures(m.store)
 }
 
 func (m *Mpp) verifySignature(
@@ -687,7 +856,7 @@ func (m *Mpp) verifySignature(
 	if err := m.verifyOnChain(ctx, signature, request, details); err != nil {
 		return core.Receipt{}, err
 	}
-	inserted, err := m.store.PutIfAbsent(ctx, consumedPrefix+payload.Signature, true)
+	inserted, err := m.consumed().Claim(ctx, payload.Signature)
 	if err != nil {
 		return core.Receipt{}, err
 	}
@@ -765,6 +934,9 @@ func verifyTransfersAgainstChallenge(tx *solana.Transaction, amount uint64, curr
 			}
 		}
 		if err := verifyMemoInstructions(tx, matched, externalID, details.Splits); err != nil {
+			return err
+		}
+		if err := verifyRequiredSigners(tx, matched); err != nil {
 			return err
 		}
 		// Native SOL payments never carry a token mint, so ATA-create
@@ -903,6 +1075,9 @@ func verifyTransfersAgainstChallenge(tx *solana.Transaction, amount uint64, curr
 	if err := verifyMemoInstructions(tx, matched, externalID, details.Splits); err != nil {
 		return err
 	}
+	if err := verifyRequiredSigners(tx, matched); err != nil {
+		return err
+	}
 	allowedOwners := make([]solana.PublicKey, 0, len(tokenExpected))
 	for _, want := range tokenExpected {
 		allowedOwners = append(allowedOwners, want.recipient)
@@ -914,6 +1089,53 @@ func verifyTransfersAgainstChallenge(tx *solana.Transaction, amount uint64, curr
 		feePayer:             feePayerKey(details),
 		requiredATAOwners:    requiredOwners,
 	})
+}
+
+// verifyRequiredSigners requires every required signer to be the fee payer
+// or the one authority that funds every matched payment transfer. Any other
+// signer authorizes nothing and only adds a signature fee, which a sponsor
+// would pay; letting each leg of a split name its own authority would let a
+// payer multiply those fees. Mirrors the rust verify_required_signers.
+func verifyRequiredSigners(tx *solana.Transaction, matched []bool) error {
+	token2022Program := solana.MustPublicKeyFromBase58(paycore.Token2022Program)
+	var fundingAuthority *solana.PublicKey
+	for index, compiled := range tx.Message.Instructions {
+		if !matched[index] {
+			continue
+		}
+		programID, err := resolveProgramID(tx, compiled.ProgramIDIndex)
+		if err != nil {
+			return err
+		}
+		var position int
+		switch {
+		case programID.Equals(solana.SystemProgramID):
+			position = 0
+		case programID.Equals(solana.TokenProgramID), programID.Equals(token2022Program):
+			position = 3
+		default:
+			continue
+		}
+		if position >= len(compiled.Accounts) || int(compiled.Accounts[position]) >= len(tx.Message.AccountKeys) {
+			continue
+		}
+		authority := tx.Message.AccountKeys[compiled.Accounts[position]]
+		if fundingAuthority != nil && !fundingAuthority.Equals(authority) {
+			return core.NewError(core.ErrCodeInvalidPayload, "payment transfers must share one funding authority")
+		}
+		fundingAuthority = &authority
+	}
+	required := int(tx.Message.Header.NumRequiredSignatures)
+	for i, signer := range tx.Message.AccountKeys {
+		if i >= required {
+			break
+		}
+		if i == 0 || (fundingAuthority != nil && signer.Equals(*fundingAuthority)) {
+			continue
+		}
+		return core.NewError(core.ErrCodeInvalidPayload, "unexpected signer in payment transaction")
+	}
+	return nil
 }
 
 // requiredATAOwners returns the split recipients whose challenge pinned
@@ -958,7 +1180,7 @@ type expectedMemo struct {
 }
 
 func buildExpectedMemos(externalID string, splits []paycore.Split) []expectedMemo {
-	expected := make([]expectedMemo, 0, 1+len(splits))
+	var expected []expectedMemo
 	if externalID != "" {
 		expected = append(expected, expectedMemo{label: "externalId", value: externalID})
 	}

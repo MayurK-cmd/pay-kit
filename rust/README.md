@@ -16,6 +16,9 @@ Python, Ruby, PHP, Lua, Kotlin, and Swift SDKs and speaks the same wire format.
 You do not need to know anything about Solana to use this library: pick a
 currency, give it your wallet address, and gate a route.
 
+For explicitly configured V2 channel callbacks on one-time MPP payments, see
+[Atomic V2 channel charges](docs/channel-charge.md).
+
 [![Rust](https://img.shields.io/badge/rust-2021-orange)]()
 [![axum](https://img.shields.io/badge/axum-0.8-blue)]()
 
@@ -33,7 +36,9 @@ demo recipient and the hosted Surfpool sandbox at `https://402.surfnet.dev:8899`
 
 ```rust
 use axum::Router;
+use solana_pay_kit::mpp::store::MemoryStore;
 use solana_pay_kit::{paid_get, PayKit, PayKitConfig, Payment};
+use std::sync::Arc;
 
 async fn report(payment: Payment) -> String {
     format!("premium content (paid {} via {})", payment.amount, payment.protocol)
@@ -43,6 +48,8 @@ async fn report(payment: Payment) -> String {
 async fn main() {
     let pay = PayKit::new(PayKitConfig {
         recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
+        realm: Some("my-service".to_string()),
+        store: Some(Arc::new(MemoryStore::new())),
         network: "localnet".to_string(),
         rpc_url: Some("https://402.surfnet.dev:8899".to_string()),
         ..Default::default()
@@ -61,6 +68,12 @@ when one was, it verifies and settles it, sets the settlement header on the
 response, and hands control to your handler. Hit `/report` with
 [`pay curl`](#run-the-example) and the customer walks through Touch ID and a
 USDC payment.
+
+Unpaid requests include a [payment hint](docs/payment-hints.md) by default: CLI and
+agent clients get Pay installation and `pay setup` instructions; browser
+navigations get a link to `https://connect.pay.sh/mcp` carrying the endpoint URL
+in `resource_uri`. Set `PayKitConfig.disable_hint` to `true` to retain the previous plain-text
+402 body. Payment challenge headers are unchanged.
 
 ### 2. Multiple gates
 
@@ -95,12 +108,15 @@ and — if you sponsor the network fee — a signer. The route handlers are
 unchanged; only `PayKitConfig` grows.
 
 ```rust
+use solana_pay_kit::mpp::store::MemoryStore;
 use solana_pay_kit::{PayKit, PayKitConfig};
 use solana_pay_kit::solana_keychain::memory::MemorySigner;
 use std::sync::Arc;
 
 let pay = PayKit::new(PayKitConfig {
     recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
+    realm: Some("my-service".to_string()),
+    store: Some(Arc::new(MemoryStore::new())),
     network: "mainnet".to_string(),
     rpc_url: Some("https://mainnet.helius-rpc.com/?api-key=YOUR_KEY".to_string()),
     challenge_binding_secret: Some(std::env::var("MPP_SECRET_KEY")?),
@@ -174,6 +190,14 @@ Payment` credential, decodes the client-signed transaction and checks recipient,
 amount, mint, splits, ATA, memos, and compute budget, optionally co-signs as fee
 payer, broadcasts, polls to `confirmed`, and emits `Payment-Receipt`.
 
+**Upgrading with pending session opens.** A session open is adopted only if it
+landed after a slot this ledger recorded before its first broadcast. Pending
+rows written by earlier releases have no such slot; they use the finalized slot
+they recorded before broadcasting instead, a slightly coarser bound. A pending
+row that recorded neither (version 1 intents, or opens whose finalized
+observation failed) is refused with "no recorded broadcast floor" and stays
+pending. Resolve those before upgrading, or refund them out of band.
+
 ### MCP with `rmcp`
 
 Enable the `rmcp` feature to use the Payment Auth MCP transport with the
@@ -227,6 +251,13 @@ after the handler runs, so it needs a `fee_payer_signer` (the fee payer signs
 the settlement as the channel's zero-share payee, and doubles as receiver
 authorizer — the voucher signer — by default) and is gated with `paid_upto_get`
 / `paid_upto_post` rather than `paid_get` / `paid_post`.
+
+The `upto` gate reads the meter only once the response body is complete, so it
+buffers the whole body before answering: a streaming handler reaches the client
+in one piece at the end. Bodies over 16 MiB, or bodies that fail mid-stream, are
+not delivered; the request settles at what was metered so far and answers 502.
+If settlement is still being retried in the background when the body is ready,
+the response is served without a `PAYMENT-RESPONSE` header.
 
 `batch-settlement` is for high-throughput APIs: the client opens one channel and
 signs a cumulative voucher per request, which the gate (`paid_batch_get` /
@@ -345,6 +376,11 @@ let route = paid_get(
 
 The resolved amount is what the credential is pinned against, so dynamic pricing
 is replay-safe too.
+
+`ctx.uri` is the public URI (including any `Router::nest` prefix), and query
+names and values are form-decoded. Dynamically priced routes answer `400` to
+query strings with malformed percent-escapes or a repeated parameter name, so
+the price and the handler can't read different values.
 
 ## Signers
 

@@ -1,5 +1,17 @@
 {
   "language": "ruby",
-  "command": ["bundle", "exec", "ruby", "exe/conformance"],
+  "command": [
+    "bundle",
+    "exec",
+    "ruby",
+    "exe/conformance"
+  ],
+  "serve": [
+    "bundle",
+    "exec",
+    "ruby",
+    "exe/conformance",
+    "--serve"
+  ],
   "cwd": "ruby"
 }

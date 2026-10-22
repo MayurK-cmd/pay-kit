@@ -26,6 +26,7 @@ local mpp_intents = require('pay_kit.protocols.mpp.charge')
 local mpp_protocol = require('pay_kit.solana.mints')
 local expires_mod  = require('pay_kit.protocols.mpp.expires')
 local error_codes  = require('pay_kit.protocol.core.error_codes')
+local price_mod    = require('pay_kit.internal.price')
 
 local M = {}
 local Adapter = {}
@@ -91,23 +92,18 @@ local function build_mpp_server(config, gate, store)
 
   local rpc = rpc_mod.new({url = config.rpc_url, transport = rpc_transport_mod.new()})
   local verifier_bundle = solana_verify.new_real_verifier({pull_signer = fee_payer_signer})
-  -- The legacy mpp.store expects (key, value) semantics on
-  -- put_if_absent (it stores arbitrary values keyed by signature).
-  -- pay_kit.store uses (key, ttl) for the x402 replay path, so
-  -- they are NOT interchangeable - bind the mpp handler to its own
-  -- store. The `store` argument from the dispatcher is reserved for
-  -- the x402 adapter.
-  local _ = store
-  -- Replay store. The default `store.memory()` is process-local and lost
-  -- on worker restart, so it only protects against replays seen by the
-  -- SAME worker since boot - acceptable for single-worker dev, NOT for a
-  -- multi-worker / multi-node production deploy where a replay reservation
-  -- must be visible across all settlers. Callers wire a shared store
-  -- (e.g. an ngx.shared.dict / Redis-backed adapter) via
-  -- `config.mpp.replay_store`; when none is supplied we fall back to the
-  -- volatile in-memory store and warn once so the dev-only nature is
-  -- explicit. Mirrors the Ruby/PHP "default volatile replay store" caveat.
-  local replay_store = config.mpp and config.mpp.replay_store
+  -- Replay store. Consumed signatures are claimed in one ledger shared
+  -- with the x402 adapter (`pay_kit.consumed_signatures`), so a payment
+  -- settled through either protocol cannot authorize a second request
+  -- through the other: both resolve the store through `shared_store`, the
+  -- operator's `config.mpp.replay_store` when set (e.g. an ngx.shared.dict /
+  -- Redis-backed adapter for multi-worker / multi-node deploys), else the
+  -- dispatcher's replay store. Only a standalone adapter built without a
+  -- store falls back to a volatile, process-local memory store, and warns
+  -- once so the dev-only nature is explicit. Mirrors the Ruby/PHP
+  -- "default volatile replay store" caveat.
+  local consumed_signatures = require('pay_kit.consumed_signatures')
+  local replay_store = consumed_signatures.shared_store(config, store)
   if not replay_store then
     replay_store = store_mod.memory()
     warn_volatile_replay_store(network)
@@ -124,12 +120,15 @@ local function build_mpp_server(config, gate, store)
   local opts = {
     recipient      = gate:pay_to(),
     currency       = primary_coin,
-    decimals       = 6,
+    -- The coin's own decimals (RULINGS C2): the server scales the gate's
+    -- human price by them, so a 9-decimal mint is not priced as 6.
+    decimals       = config:decimals_for(primary_coin),
     secret_key     = config.mpp.challenge_binding_secret,
     realm          = config.mpp.realm,
     network        = network,
     rpc_url        = config.rpc_url,
     verify_payment = handler:as_callback(),
+    reconcile_expired = handler:reconcile_expired_callback(),
   }
   if fee_payer_signer then
     opts.fee_payer = true
@@ -153,13 +152,13 @@ function M.set_splits_override(gate_name, splits)
   SPLITS_OVERRIDE[gate_name] = splits
 end
 
-local function splits_for(gate)
+local function splits_for(gate, decimals)
   local override = SPLITS_OVERRIDE[gate:name()]
   if override and #override > 0 then return override end
   if not gate:has_fees() then return nil end
   local out = {}
   for _, fee in ipairs(gate:fees()) do
-    out[#out + 1] = {recipient = fee:recipient(), amount = tostring(fee:units())}
+    out[#out + 1] = {recipient = fee:recipient(), amount = price_mod.atomic_units(fee:units(), decimals)}
   end
   return out
 end
@@ -216,14 +215,14 @@ Adapter.detect = function(_, headers) return M.detect(headers) end
 -- the cross-SDK adapter contract.
 function Adapter:accepts_entry(gate, _req)
   local server, _config = self:_server_for(gate)
-  local amount_units = tostring(gate:total_units())
+  local amount_units = price_mod.atomic_units(gate:total_units(), server.decimals)
   return {
     protocol     = 'mpp',
     scheme       = 'charge',
     amount       = amount_units,
     currency     = gate:amount():primary_coin(),
     payTo        = gate:pay_to(),
-    splits       = splits_for(gate),
+    splits       = splits_for(gate, server.decimals),
     realm        = server.realm,
   }
 end
@@ -237,7 +236,7 @@ function Adapter:challenge_headers(gate, _req)
   local server, config = self:_server_for(gate)
   local display_amount = gate:amount():amount_string()
   local options = {}
-  local splits = splits_for(gate)
+  local splits = splits_for(gate, server.decimals)
   if splits then options.splits = splits end
   -- Wire the configured challenge TTL into issuance so signed challenges
   -- are not valid indefinitely. `config.mpp.expires_in` is seconds-from-now
@@ -295,19 +294,20 @@ function Adapter:verify_and_settle(gate, req)
   -- feePayer/feePayerKey). Mirrors PHP Adapter::chargeRequestFor and Ruby
   -- Mpp::Server::Charge#charge which both pass the route's full request
   -- into verification.
-  local currency = gate:amount():primary_coin()
-  local is_native_sol = string.lower(currency or '') == 'sol'
+  -- The server resolved the configured coin to its wire form ("sol" or the
+  -- mint) at boot; bind verification to that same value.
+  local currency = server.currency
+  local is_native_sol = currency == 'sol'
   local expected_method_details = {
     network = server.network,
   }
   if not is_native_sol then
     expected_method_details.decimals = server.decimals
-    if mpp_protocol.stablecoin_symbol(currency) then
-      expected_method_details.tokenProgram =
-        mpp_protocol.default_token_program_for_currency(currency, server.network)
-    end
+    -- The token program the server resolved at boot and emits on every
+    -- challenge (known stablecoin table or on-chain owner lookup).
+    expected_method_details.tokenProgram = server.token_program
   end
-  local expected_splits = splits_for(gate)
+  local expected_splits = splits_for(gate, server.decimals)
   if expected_splits then
     expected_method_details.splits = expected_splits
   end
@@ -318,7 +318,7 @@ function Adapter:verify_and_settle(gate, req)
     end
   end
   local expected = {
-    amount        = tostring(gate:total_units()),
+    amount        = price_mod.atomic_units(gate:total_units(), server.decimals),
     currency      = currency,
     recipient     = gate:pay_to(),
     methodDetails = expected_method_details,

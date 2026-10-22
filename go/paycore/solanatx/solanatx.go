@@ -24,6 +24,7 @@ import (
 	"github.com/gagliardetto/solana-go/programs/token"
 	token2022 "github.com/gagliardetto/solana-go/programs/token-2022"
 	"github.com/gagliardetto/solana-go/rpc"
+	"github.com/gagliardetto/solana-go/rpc/jsonrpc"
 
 	"github.com/solana-foundation/pay-kit/go/paycore"
 )
@@ -235,6 +236,68 @@ func SignTransaction(tx *solana.Transaction, signer Signer) error {
 	return nil
 }
 
+// ErrSignatureVerification is wrapped by VerifyClientSignatures and
+// VerifiedSignature when a transaction carries the wrong number of
+// signatures or one that does not verify.
+var ErrSignatureVerification = errors.New("transaction signature verification failed")
+
+// VerifyClientSignatures checks the signatures a client placed on a
+// transaction before the server claims, co-signs, simulates or sends it.
+// The signature list must have exactly header.num_required_signatures
+// entries. When serverFeePayer is non-nil it must be account key zero, and
+// that one slot is not checked: the server always overwrites it with its
+// own signature when it co-signs, so whatever the client put there
+// (normally nothing) never names the payment. Every other required
+// signature must verify against the exact message. A signature that does
+// not verify names some other transaction, so a refusal here is definite:
+// nothing was claimed and nothing was sent.
+//
+// It is the single signature check of every server verify path; the
+// post-cosign VerifiedSignature is this check with no server slot.
+func VerifyClientSignatures(tx *solana.Transaction, serverFeePayer *solana.PublicKey) error {
+	required := int(tx.Message.Header.NumRequiredSignatures)
+	keys := tx.Message.AccountKeys
+	if required == 0 || len(tx.Signatures) != required || len(keys) < required {
+		return fmt.Errorf("%w: message requires %d signatures, transaction carries %d",
+			ErrSignatureVerification, required, len(tx.Signatures))
+	}
+	message, err := tx.Message.MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("%w: serialize message: %w", ErrSignatureVerification, err)
+	}
+	for index, signature := range tx.Signatures {
+		key := keys[index]
+		if serverFeePayer != nil && index == 0 {
+			if !key.Equals(*serverFeePayer) {
+				return fmt.Errorf("%w: account zero %s is not the server fee payer %s",
+					ErrSignatureVerification, key, *serverFeePayer)
+			}
+			continue
+		}
+		if !signature.Verify(key, message) {
+			return fmt.Errorf("%w: invalid client transaction signature for required signer %s",
+				ErrSignatureVerification, key)
+		}
+	}
+	return nil
+}
+
+// VerifiedSignature returns the transaction's identity, its first signature,
+// only once every signature the message requires is present and verifies
+// against the exact message. Call it after the server has co-signed its own
+// slot: it is the only source of the key a settlement claims, so nothing can
+// be claimed, recorded pending or sent on a signature that does not belong
+// to this message. A forged slot-0 signature copied from a landed
+// transaction would otherwise name the payment, and a retry would be
+// reconciled on that other transaction's status. A refusal here is definite:
+// nothing was claimed and nothing was sent.
+func VerifiedSignature(tx *solana.Transaction) (solana.Signature, error) {
+	if err := VerifyClientSignatures(tx, nil); err != nil {
+		return solana.Signature{}, err
+	}
+	return tx.Signatures[0], nil
+}
+
 // ResolveTokenProgram resolves the mint owner into the token program ID.
 func ResolveTokenProgram(ctx context.Context, rpcClient RPCClient, mint solana.PublicKey, tokenProgramHint string) (solana.PublicKey, error) {
 	if tokenProgramHint != "" {
@@ -258,6 +321,52 @@ func ResolveTokenProgram(ctx context.Context, rpcClient RPCClient, mint solana.P
 	default:
 		return solana.PublicKey{}, fmt.Errorf("unsupported mint owner %s", account.Value.Owner)
 	}
+}
+
+// MintInfo is the subset of an SPL mint account a payment builder or
+// verifier needs: the owning token program and the mint's decimals.
+type MintInfo struct {
+	TokenProgram solana.PublicKey
+	Decimals     uint8
+}
+
+// mintAccountSize is the base SPL mint layout length (Token-2022 mints may
+// carry extensions after it); decimals live at byte 44 and is_initialized
+// at byte 45.
+const mintAccountSize = 82
+
+// FetchMint reads a mint account and returns its token program and
+// decimals. It fails when the account does not exist, is owned by neither
+// the Token nor the Token-2022 program, or is not an initialized mint, so
+// callers never fall back to a guessed program or decimals.
+func FetchMint(ctx context.Context, rpcClient RPCClient, mint solana.PublicKey) (MintInfo, error) {
+	account, err := rpcClient.GetAccountInfoWithOpts(ctx, mint, &rpc.GetAccountInfoOpts{
+		Commitment: rpc.CommitmentConfirmed,
+		Encoding:   solana.EncodingBase64,
+	})
+	if err != nil {
+		return MintInfo{}, err
+	}
+	if account == nil || account.Value == nil {
+		return MintInfo{}, fmt.Errorf("mint account not found")
+	}
+	var program solana.PublicKey
+	switch account.Value.Owner.String() {
+	case paycore.TokenProgram:
+		program = solana.TokenProgramID
+	case paycore.Token2022Program:
+		program = solana.MustPublicKeyFromBase58(paycore.Token2022Program)
+	default:
+		return MintInfo{}, fmt.Errorf("unsupported mint owner %s", account.Value.Owner)
+	}
+	var data []byte
+	if account.Value.Data != nil {
+		data = account.Value.Data.GetBinary()
+	}
+	if len(data) < mintAccountSize || data[45] != 1 {
+		return MintInfo{}, fmt.Errorf("account %s is not an initialized mint", mint)
+	}
+	return MintInfo{TokenProgram: program, Decimals: data[44]}, nil
 }
 
 // ResolveRecentBlockhash returns the provided blockhash or fetches one from RPC.
@@ -316,6 +425,19 @@ func SendTransaction(ctx context.Context, rpcClient RPCClient, tx *solana.Transa
 		SkipPreflight:       false,
 		PreflightCommitment: rpc.CommitmentConfirmed,
 	})
+}
+
+// sendPreflightFailureCode is the JSON-RPC error code a node returns when
+// sendTransaction's preflight simulation rejects the transaction.
+const sendPreflightFailureCode = -32002
+
+// IsPreflightRejection reports whether a sendTransaction error is a
+// preflight rejection: the one send failure that proves the node did not
+// forward the transaction. Any other error (a lost response, a timeout, a
+// 5xx from a proxy that already forwarded it) leaves the outcome unknown.
+func IsPreflightRejection(err error) bool {
+	var rpcErr *jsonrpc.RPCError
+	return errors.As(err, &rpcErr) && rpcErr.Code == sendPreflightFailureCode
 }
 
 // FetchTransaction reads a confirmed transaction back by signature and

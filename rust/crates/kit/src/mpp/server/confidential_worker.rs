@@ -13,6 +13,8 @@
 //!
 //! The worker binds an `Mpp` per settlement because `Mpp` fixes its recipient +
 //! currency at construction; the shared store is injected via `Config.store`.
+//! The store is the challenge replay ledger, so every replica (and a restarted
+//! process) must be given the same durable instance.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +23,8 @@ use solana_keychain::{SolanaSigner, TransactionSigner};
 use tokio::sync::{mpsc, oneshot};
 
 use super::charge::{Config as MppConfig, Mpp, VerificationError};
-use crate::mpp::store::{MemoryStore, Store};
+use crate::core::tx::TxVersion;
+use crate::mpp::store::Store;
 use crate::mpp::{ChargeRequest, PaymentCredential, Receipt};
 
 const SWEEP_INTERVAL_SECS: u64 = 300;
@@ -42,11 +45,28 @@ pub struct ConfidentialWorkerConfig {
     /// Gateway fee-payer pubkey — the sweep `Mpp`'s nominal recipient.
     pub fee_payer_pubkey: String,
     /// Payee wallet signer, when the gateway controls the recipient. `Some`
-    /// enables recipient-key settlement (the worker decrypts the recipient's
-    /// pending-balance delta and enforces the exact amount); `None` is
-    /// facilitator/trust-proofs mode (no amount enforcement — only valid when
-    /// the gateway is not the payee, e.g. relaying to an arbitrary recipient).
+    /// enables recipient-key settlement (the worker decrypts the transfer's
+    /// recipient ciphertext and enforces the exact amount); `None` is
+    /// facilitator mode (relaying to an arbitrary recipient).
     pub recipient_signer: Option<Arc<dyn SolanaSigner>>,
+    /// Mint auditor ElGamal keypair bytes: enforces the exact amount in
+    /// facilitator mode. See [`MppConfig::confidential_auditor`].
+    pub auditor: Option<[u8; 64]>,
+    /// Accept bundles whose amount cannot be decrypted (no recipient signer, no
+    /// auditor). Receipts then do not attest the amount. See
+    /// [`MppConfig::accept_unverified_confidential_amount`].
+    pub accept_unverified_amount: bool,
+    /// Challenge replay and orphan-guard store. REQUIRED, and must be shared
+    /// by every worker settling the same challenges (replicas, restarts): a
+    /// process-local store lets a still-valid challenge settle twice.
+    pub store: Arc<dyn Store>,
+}
+
+struct ConfidentialWorkerRuntime {
+    config: ConfidentialWorkerConfig,
+    signer: Arc<dyn TransactionSigner>,
+    store: Arc<dyn Store>,
+    tx_version: TxVersion,
 }
 
 /// Messages the worker accepts. Boxed payloads keep the enum small.
@@ -98,18 +118,36 @@ pub fn spawn(
     cfg: ConfidentialWorkerConfig,
     signer: Arc<dyn TransactionSigner>,
 ) -> ConfidentialHandle {
+    spawn_with_tx_version(cfg, signer, TxVersion::V0)
+}
+
+/// Spawn a confidential worker that accepts exactly one transaction version.
+/// This lets deployments retire the multi-transaction version-0 flow without
+/// changing the compatibility default of [`spawn`].
+pub fn spawn_with_tx_version(
+    cfg: ConfidentialWorkerConfig,
+    signer: Arc<dyn TransactionSigner>,
+    tx_version: TxVersion,
+) -> ConfidentialHandle {
     let (tx, mut rx) = mpsc::channel::<ConfidentialMsg>(CHANNEL_CAPACITY);
-    let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    let store = cfg.store.clone();
 
     tokio::spawn(async move {
+        let runtime = ConfidentialWorkerRuntime {
+            config: cfg,
+            signer,
+            store,
+            tx_version,
+        };
         // Build the long-lived sweep Mpp once (shares the store with settlement).
         let sweep_mpp = build_mpp(
-            &cfg,
-            cfg.fee_payer_pubkey.clone(),
-            cfg.sweep_currency.clone(),
-            cfg.sweep_decimals,
-            signer.clone(),
-            store.clone(),
+            &runtime.config,
+            runtime.config.fee_payer_pubkey.clone(),
+            runtime.config.sweep_currency.clone(),
+            runtime.config.sweep_decimals,
+            runtime.signer.clone(),
+            runtime.store.clone(),
+            runtime.tx_version,
         );
         if sweep_mpp.is_none() {
             tracing::warn!("confidential worker: sweep Mpp unavailable; orphan sweep disabled");
@@ -130,7 +168,7 @@ pub fn spawn(
                             reply,
                         } => {
                             let result = settle(
-                                &cfg, &signer, &store, &credential, &charge_request, &currency, decimals,
+                                &runtime, &credential, &charge_request, &currency, decimals,
                             )
                             .await;
                             let _ = reply.send(result);
@@ -162,9 +200,7 @@ pub fn spawn(
 /// Settle one confidential bundle: build a per-charge `Mpp` (sharing the worker's
 /// store + signer) and verify the credential through it.
 async fn settle(
-    cfg: &ConfidentialWorkerConfig,
-    signer: &Arc<dyn TransactionSigner>,
-    store: &Arc<dyn Store>,
+    runtime: &ConfidentialWorkerRuntime,
     credential: &PaymentCredential,
     charge_request: &ChargeRequest,
     currency: &str,
@@ -175,14 +211,15 @@ async fn settle(
     let recipient = charge_request
         .recipient
         .clone()
-        .unwrap_or_else(|| cfg.fee_payer_pubkey.clone());
+        .unwrap_or_else(|| runtime.config.fee_payer_pubkey.clone());
     let mpp = build_mpp(
-        cfg,
+        &runtime.config,
         recipient,
         currency.to_string(),
         decimals,
-        signer.clone(),
-        store.clone(),
+        runtime.signer.clone(),
+        runtime.store.clone(),
+        runtime.tx_version,
     )
     .ok_or_else(|| VerificationError::new("failed to build settlement Mpp"))?;
 
@@ -196,8 +233,9 @@ fn build_mpp(
     decimals: u8,
     signer: Arc<dyn TransactionSigner>,
     store: Arc<dyn Store>,
+    tx_version: TxVersion,
 ) -> Option<Mpp> {
-    Mpp::new(MppConfig {
+    let mut mpp = Mpp::new(MppConfig {
         recipient,
         currency,
         decimals,
@@ -209,9 +247,143 @@ fn build_mpp(
         fee_payer_signer: Some(signer),
         // Recipient-key amount enforcement when the gateway controls the payee.
         recipient_signer: cfg.recipient_signer.clone(),
+        confidential_auditor: cfg.auditor,
+        accept_unverified_confidential_amount: cfg.accept_unverified_amount,
         store: Some(store),
         html: false,
         ..Default::default()
     })
-    .ok()
+    .ok()?;
+    mpp.accepted_versions = vec![tx_version];
+    Some(mpp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mpp::store::MemoryStore;
+
+    const SECRET: &str = "worker-test-secret-with-at-least-32-bytes";
+    const REALM: &str = "worker-test";
+
+    fn gateway() -> Arc<dyn TransactionSigner> {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
+        let mut kp = [0u8; 64];
+        kp[..32].copy_from_slice(sk.as_bytes());
+        kp[32..].copy_from_slice(sk.verifying_key().as_bytes());
+        Arc::new(solana_keychain::MemorySigner::from_bytes(&kp).unwrap())
+    }
+
+    fn worker(store: Arc<dyn Store>) -> ConfidentialHandle {
+        let signer = gateway();
+        spawn(
+            ConfidentialWorkerConfig {
+                network: "mainnet".into(),
+                rpc_url: "http://127.0.0.1:1".into(),
+                challenge_binding_secret: Some(SECRET.into()),
+                realm: REALM.into(),
+                sweep_currency: "PYUSD".into(),
+                sweep_decimals: 6,
+                fee_payer_pubkey: signer.pubkey().to_string(),
+                recipient_signer: None,
+                auditor: None,
+                accept_unverified_amount: false,
+                store,
+            },
+            signer,
+        )
+    }
+
+    fn credential(bundle: &str) -> (PaymentCredential, ChargeRequest) {
+        let recipient = solana_pubkey::Pubkey::new_unique().to_string();
+        let gateway = gateway();
+        let gateway_key = gateway.pubkey().to_string();
+        let mpp = Mpp::new(MppConfig {
+            recipient: recipient.clone(),
+            currency: "PYUSD".into(),
+            decimals: 6,
+            network: "mainnet".into(),
+            rpc_url: Some("http://127.0.0.1:1".into()),
+            challenge_binding_secret: Some(SECRET.into()),
+            realm: Some(REALM.into()),
+            fee_payer: true,
+            fee_payer_signer: Some(gateway),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
+            ..Default::default()
+        })
+        .unwrap();
+        let request: ChargeRequest = mpp
+            .charge_challenge(&ChargeRequest {
+                amount: "1000000".into(),
+                currency: "PYUSD".into(),
+                recipient: Some(recipient),
+                method_details: Some(serde_json::json!({
+                    "network": "mainnet",
+                    "decimals": 6,
+                    "confidential": true,
+                    "feePayer": true,
+                    "feePayerKey": gateway_key,
+                })),
+                ..Default::default()
+            })
+            .unwrap()
+            .request
+            .decode()
+            .unwrap();
+        let challenge = mpp.charge_challenge(&request).unwrap();
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::json!({ "type": "bundle", "transactions": [bundle] }),
+        );
+        (credential, request)
+    }
+
+    // A second worker (another replica, or this one after a restart) must see
+    // the first worker's claim on the challenge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workers_sharing_a_store_settle_a_challenge_once() {
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let (first, request) = credential("AA==");
+        let mut second = first.clone();
+        second.payload = serde_json::json!({ "type": "bundle", "transactions": ["AQ=="] });
+
+        let a = worker(store.clone());
+        let err = a
+            .settle(first, request.clone(), "PYUSD".into(), 6)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.message.contains("already presented"),
+            "{}",
+            err.message
+        );
+
+        let b = worker(store);
+        let err = b
+            .settle(second, request, "PYUSD".into(), 6)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("already presented"), "{}", err.message);
+    }
+
+    // Control: isolated stores are exactly what let the replay through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workers_with_separate_stores_do_not_share_claims() {
+        let (first, request) = credential("AA==");
+        let mut second = first.clone();
+        second.payload = serde_json::json!({ "type": "bundle", "transactions": ["AQ=="] });
+        worker(Arc::new(MemoryStore::new()))
+            .settle(first, request.clone(), "PYUSD".into(), 6)
+            .await
+            .unwrap_err();
+        let err = worker(Arc::new(MemoryStore::new()))
+            .settle(second, request, "PYUSD".into(), 6)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.message.contains("already presented"),
+            "{}",
+            err.message
+        );
+    }
 }

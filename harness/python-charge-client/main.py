@@ -32,7 +32,7 @@ Env contract (shared with the rust/ts/go charge clients):
 * ``MPP_HARNESS_RPC_URL``           - required, Solana RPC. Live in practice: the
   MPP server does not stamp ``methodDetails.recentBlockhash``, so the builder
   falls back to ``getLatestBlockhash`` at ``confirmed`` commitment.
-* ``MPP_HARNESS_CLIENT_SECRET_KEY`` - required, JSON int array (solders Keypair).
+* ``MPP_HARNESS_CLIENT_SECRET_KEY`` - required, JSON int array (keychain signer).
 * ``MPP_HARNESS_PAYMENT_MODE``      - optional, ``pull`` (default) or ``push``.
 * ``MPP_HARNESS_SETTLEMENT_HEADER`` - optional, receipt header name.
 """
@@ -64,7 +64,6 @@ if _python_src.is_dir():
 
 import httpx  # noqa: E402
 from solana.rpc.async_api import AsyncClient  # type: ignore[import-untyped]  # noqa: E402
-from solders.keypair import Keypair  # type: ignore[import-untyped]  # noqa: E402
 
 from solana_pay_kit.protocols.mpp.client.charge import (  # noqa: E402
     build_credential_header,
@@ -73,31 +72,7 @@ from solana_pay_kit.protocols.mpp.core.headers import (  # noqa: E402
     parse_www_authenticate_all,
 )
 from solana_pay_kit.protocols.mpp.core.types import PaymentChallenge  # noqa: E402
-
-
-class _MintOwnerRpc:
-    """Adapter-side shim exposing the account lookup the charge client calls.
-
-    ``protocols.mpp.client.charge._fetch_mint_owner`` calls
-    ``rpc_client.get_account(...)`` -- the Rust-shaped name. solana-py's
-    ``AsyncClient`` has no such method; it is ``get_account_info``. Because the
-    charge challenge never stamps ``methodDetails.tokenProgram``,
-    ``_resolve_token_program`` consults the chain on every scenario, so passing
-    a bare ``AsyncClient`` raises ``AttributeError`` before the first hop.
-
-    Keeping the workaround here rather than in the SDK keeps this adapter PR
-    scoped to the harness. Delete this class once the SDK calls
-    ``get_account_info``; see the bug write-up on this PR.
-    """
-
-    def __init__(self, client: AsyncClient) -> None:
-        self._client = client
-
-    async def get_account(self, pubkey: Any) -> Any:
-        return await self._client.get_account_info(pubkey)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._client, name)
+from solana_pay_kit.signer import Signer  # noqa: E402
 
 
 def _require_env(name: str) -> str:
@@ -165,7 +140,7 @@ async def _run() -> None:
         )
         return
 
-    signer = Keypair.from_json(secret)
+    signer = Signer.json(secret)
     rpc = AsyncClient(rpc_url)
     try:
         async with httpx.AsyncClient(timeout=60.0) as http:
@@ -184,7 +159,7 @@ async def _run() -> None:
 
             authorization = await build_credential_header(
                 signer=signer,
-                rpc_client=_MintOwnerRpc(rpc),
+                rpc_client=rpc,
                 challenge=challenge,
                 # Audit #26 opts the unknown-Token-2022 check out. The harness
                 # deploys its own mints on a local validator, so the

@@ -75,8 +75,14 @@ type SessionConfig struct {
 	// Currency identifier (e.g., "USDC", mint address).
 	Currency string
 
-	// Decimals is the token decimals (default 6 for USDC).
+	// Decimals is the token decimals. Required as given: NewSession
+	// resolves it from the asset; direct SessionConfig users must set it.
 	Decimals uint8
+
+	// TokenProgram is the mint's owning token program (base58), used for
+	// settlement. Empty falls back to the known-stablecoin table, which is
+	// only correct for those mints; NewSession always sets it.
+	TokenProgram string
 
 	// Network is the Solana network: "mainnet", "devnet", "localnet".
 	Network string
@@ -91,7 +97,7 @@ type SessionConfig struct {
 
 	// SettlementWindowSeconds is the channel's forced-close grace period in
 	// seconds. When positive, a non-zero voucher expiry must outlast this
-	// window (expiresAt >= now + settlementWindowSeconds) so the async settle
+	// window (expiresAt > now + settlementWindowSeconds) so the async settle
 	// transaction cannot be rejected on-chain after the server has served. 0
 	// disables the extra margin (plain `expiresAt > now` only). A voucher
 	// expiresAt of 0 never expires regardless of this setting. Should match the

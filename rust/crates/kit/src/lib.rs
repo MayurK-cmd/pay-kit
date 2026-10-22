@@ -32,6 +32,9 @@ pub mod generated;
 #[cfg(any(feature = "mpp", feature = "x402"))]
 pub mod core;
 
+#[cfg(any(feature = "mpp", feature = "x402"))]
+pub use core::credit_provider::{validate_credit_providers, CreditProvider, CreditProviderError};
+
 /// Machine Payments Protocol (Solana `charge`/`session`/`subscription`).
 #[cfg(feature = "mpp")]
 pub mod mpp;
@@ -67,5 +70,5 @@ mod gate;
 #[cfg(feature = "axum")]
 pub use gate::{
     paid_batch_get, paid_batch_post, paid_get, paid_post, paid_upto_get, paid_upto_post, Charge,
-    PayKit, PayKitConfig, PayKitError, Payment, Price, PriceCtx, Protocol,
+    PayKit, PayKitConfig, PayKitError, Payment, PaymentNotConsumed, Price, PriceCtx, Protocol,
 };

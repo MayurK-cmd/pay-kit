@@ -53,6 +53,18 @@ pub fn validate_network(network: &str) -> Result<(), crate::mpp::error::Error> {
     }
 }
 
+/// Canonical slug of a challenge's `methodDetails.network`, `None` for an
+/// unsupported value. An omitted network is the spec's mainnet default;
+/// `mainnet-beta` is accepted from servers as the legacy mainnet spelling.
+pub(crate) fn canonical_network(network: Option<&str>) -> Option<&'static str> {
+    match network {
+        None | Some(NETWORK_MAINNET) | Some("mainnet-beta") => Some(NETWORK_MAINNET),
+        Some(NETWORK_DEVNET) => Some(NETWORK_DEVNET),
+        Some(NETWORK_LOCALNET) => Some(NETWORK_LOCALNET),
+        Some(_) => None,
+    }
+}
+
 /// Default RPC URLs per network. Inputs are expected to be canonical
 /// slugs (see `validate_network`); unknown slugs fall through to the
 /// mainnet RPC for backwards compatibility, but `validate_network` at
@@ -427,6 +439,7 @@ mod tests {
             auditor_elgamal_pubkey: None,
             recipient_elgamal_pubkey: None,
             transaction_versions: None,
+            channel_charge: None,
         };
         let json = serde_json::to_string(&md).unwrap();
         let deserialized: MethodDetails = serde_json::from_str(&json).unwrap();
@@ -620,14 +633,14 @@ mod tests {
         let splits: Vec<Split> = (0..(MAX_SPLITS + 1))
             .map(|_| split(&unique_pubkey(), "1"))
             .collect();
-        let err = validate_splits(&splits).err().expect("too many splits");
+        let err = validate_splits(&splits).expect_err("too many splits");
         assert!(matches!(err, crate::mpp::error::Error::TooManySplits));
     }
 
     #[test]
     fn validate_splits_rejects_invalid_recipient() {
         let splits = vec![split("not-a-pubkey!!", "100")];
-        let err = validate_splits(&splits).err().expect("bad recipient");
+        let err = validate_splits(&splits).expect_err("bad recipient");
         assert!(
             format!("{err}").contains("splits[0]: invalid recipient pubkey"),
             "got: {err}"
@@ -637,7 +650,7 @@ mod tests {
     #[test]
     fn validate_splits_rejects_unparseable_amount() {
         let splits = vec![split(&unique_pubkey(), "not-a-number")];
-        let err = validate_splits(&splits).err().expect("bad amount");
+        let err = validate_splits(&splits).expect_err("bad amount");
         assert!(
             format!("{err}").contains("is not a valid u64"),
             "got: {err}"
@@ -657,7 +670,7 @@ mod tests {
             split(&unique_pubkey(), &near_max.to_string()),
             split(&unique_pubkey(), &near_max.to_string()),
         ];
-        let err = validate_splits(&splits).err().expect("aggregate overflow");
+        let err = validate_splits(&splits).expect_err("aggregate overflow");
         assert!(format!("{err}").contains("overflows u64"), "got: {err}");
     }
 
@@ -676,9 +689,8 @@ mod tests {
     fn validate_splits_rejects_duplicate_recipient_and_memo() {
         let dup = unique_pubkey();
         let splits = vec![split(&dup, "100"), split(&dup, "200")];
-        let err = validate_splits(&splits)
-            .err()
-            .expect("duplicate recipient and memo should be rejected");
+        let err =
+            validate_splits(&splits).expect_err("duplicate recipient and memo should be rejected");
         assert!(
             format!("{err}").contains("duplicate recipient and memo"),
             "got: {err}"
@@ -691,8 +703,7 @@ mod tests {
         let mut with_empty_memo = split(&dup, "200");
         with_empty_memo.memo = Some(String::new());
         let err = validate_splits(&[split(&dup, "100"), with_empty_memo])
-            .err()
-            .expect("empty memo must not create a distinct settlement leg");
+            .expect_err("empty memo must not create a distinct settlement leg");
         assert!(format!("{err}").contains("duplicate recipient and memo"));
     }
 
@@ -792,8 +803,35 @@ mod tests {
             token_program: Some(programs::TOKEN_2022_PROGRAM.to_string()),
             confidential: Some(true),
             auditor_elgamal_pubkey: Some("auditor-key".to_string()),
+            fee_payer: Some(true),
+            fee_payer_key: Some("gateway-key".to_string()),
             ..MethodDetails::default()
         }
+    }
+
+    // The gateway funds every bundle transaction, so an unsponsored
+    // confidential charge is contradictory and never issued or paid.
+    #[test]
+    fn validate_confidential_requires_gateway_sponsorship() {
+        for md in [
+            MethodDetails {
+                fee_payer: None,
+                ..confidential_md()
+            },
+            MethodDetails {
+                fee_payer: Some(false),
+                ..confidential_md()
+            },
+            MethodDetails {
+                fee_payer_key: None,
+                ..confidential_md()
+            },
+        ] {
+            let err = validate_confidential_charge(mints::USDPT_MAINNET, &md)
+                .expect_err("unsponsored confidential charge");
+            assert!(err.to_string().contains("gateway-sponsored"), "{err}");
+        }
+        validate_confidential_charge(mints::USDPT_MAINNET, &confidential_md()).unwrap();
     }
 
     #[test]
@@ -810,9 +848,8 @@ mod tests {
 
     #[test]
     fn validate_confidential_rejects_native_sol() {
-        let err = validate_confidential_charge("sol", &confidential_md())
-            .err()
-            .expect("sol rejected");
+        let err =
+            validate_confidential_charge("sol", &confidential_md()).expect_err("sol rejected");
         assert!(format!("{err}").contains("not native SOL"), "got: {err}");
     }
 
@@ -821,8 +858,7 @@ mod tests {
         let mut md = confidential_md();
         md.token_program = Some(programs::TOKEN_PROGRAM.to_string());
         let err = validate_confidential_charge(mints::USDPT_MAINNET, &md)
-            .err()
-            .expect("legacy token program rejected");
+            .expect_err("legacy token program rejected");
         assert!(format!("{err}").contains("Token-2022"), "got: {err}");
     }
 
@@ -838,8 +874,7 @@ mod tests {
         // A present-but-empty auditor pubkey is malformed and rejected.
         md.auditor_elgamal_pubkey = Some(String::new());
         let err = validate_confidential_charge(mints::USDPT_MAINNET, &md)
-            .err()
-            .expect("empty auditor rejected");
+            .expect_err("empty auditor rejected");
         assert!(
             format!("{err}").contains("auditorElgamalPubkey"),
             "got: {err}"
@@ -856,9 +891,8 @@ mod tests {
             label: None,
             memo: None,
         }]);
-        let err = validate_confidential_charge(mints::USDPT_MAINNET, &md)
-            .err()
-            .expect("splits rejected");
+        let err =
+            validate_confidential_charge(mints::USDPT_MAINNET, &md).expect_err("splits rejected");
         assert!(format!("{err}").contains("splits"), "got: {err}");
     }
 
@@ -960,6 +994,10 @@ mod tests {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MethodDetails {
+    /// Explicit decoded-transaction profile; never a direct-transfer extension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_charge: Option<super::channel_charge::ChannelChargeProfile>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
 
@@ -1164,6 +1202,17 @@ pub fn validate_confidential_charge(
     if md.splits.as_ref().is_some_and(|s| !s.is_empty()) {
         return Err(Error::InvalidConfig(
             "confidential transfers cannot be combined with splits".into(),
+        ));
+    }
+
+    // The gateway funds every bundle transaction (fees, proof and record
+    // accounts), so a confidential charge is sponsored by construction. A
+    // challenge that says otherwise is contradictory: the server would fund a
+    // charge it declared unsponsored.
+    if md.fee_payer != Some(true) || md.fee_payer_key.as_deref().is_none_or(str::is_empty) {
+        return Err(Error::InvalidConfig(
+            "confidential charges are gateway-sponsored: feePayer must be true and feePayerKey set"
+                .into(),
         ));
     }
 

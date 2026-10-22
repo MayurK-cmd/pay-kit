@@ -18,16 +18,20 @@ import struct
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from solana_keychain import TransactionSigner
 from solders.hash import Hash  # type: ignore[import-untyped]
-from solders.keypair import Keypair  # type: ignore[import-untyped]
 from solders.pubkey import Pubkey  # type: ignore[import-untyped]
 from solders.signature import Signature  # type: ignore[import-untyped]
-from solders.transaction import Transaction  # type: ignore[import-untyped]
 
 from solana_pay_kit._paycore.errors import PaymentError
 from solana_pay_kit._paycore.solana import default_token_program_for_currency, resolve_mint
+from solana_pay_kit._paycore.transaction import (
+    SignatureCheckError,
+    build_partially_signed_v0_transaction,
+    verify_required_signatures,
+)
 from solana_pay_kit.protocols.mpp._paymentchannels import (
     PROGRAM_ID,
     Distribution,
@@ -212,6 +216,23 @@ def top_up_transaction_signature(transaction_b64: str) -> str | None:
     return str(signatures[0])
 
 
+def _verify_signers(raw: bytes, what: str, *, unsigned: Pubkey | None = None) -> None:
+    """Refuse ``raw`` unless every required signer has signed it.
+
+    See :func:`~solana_pay_kit._paycore.transaction.verify_required_signatures`:
+    the signature count must equal ``num_required_signatures`` and every slot
+    but ``unsigned``'s placeholder must verify.
+    """
+    from solders.transaction import VersionedTransaction
+
+    try:
+        verify_required_signatures(VersionedTransaction.from_bytes(raw), unsigned=unsigned)
+    except SignatureCheckError as exc:
+        raise PaymentError(f"{what} transaction signature verification failed: {exc}", code="invalid-payload") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise PaymentError(f"could not decode {what} transaction: {exc}", code="invalid-payload") from exc
+
+
 def _signed_message_bytes(message: Any) -> bytes:
     """Return the exact bytes covered by signatures: ``0x80`` prefix + body
     for v0, the bare message for legacy."""
@@ -261,7 +282,7 @@ async def verify_open_tx(
         )
 
     try:
-        _raw, message, account_keys, instructions, signatures = _decode_transaction(payload.transaction)
+        raw, message, account_keys, instructions, signatures = _decode_transaction(payload.transaction)
     except PaymentError:
         # Already a structured rejection (e.g. the address-lookup-table guard);
         # surface it verbatim rather than wrapping it as a generic decode error.
@@ -421,6 +442,9 @@ async def verify_open_tx(
         raise PaymentError("channel payer signature is missing", code="invalid-payload")
     if not signatures[payer_index].verify(payer, _signed_message_bytes(message)):
         raise PaymentError("channel payer signature is invalid", code="invalid-payload")
+    # Every other required signer must have signed too; only the advertised
+    # fee payer's slot may still be empty, for the server to co-sign.
+    _verify_signers(raw, "open", unsigned=Pubkey.from_string(expected.fee_payer) if expected.fee_payer else None)
 
     return VerifyOpenTxResult(
         channel_id=str(channel),
@@ -436,7 +460,7 @@ def new_open_tx_verifier(
     config: OpenVerifierConfig,
     rpc_client: RpcClient | None,
     *,
-    fee_payer_signer: Any | None = None,
+    fee_payer_signer: TransactionSigner | None = None,
 ) -> OpenTxVerifier:
     """Return the on-chain open verifier to install on the session config.
 
@@ -583,6 +607,9 @@ def new_top_up_tx_verifier(
         payer = Pubkey.from_string(state.payer)
         if payer_index >= len(signatures) or not signatures[payer_index].verify(payer, _signed_message_bytes(message)):
             raise PaymentError("top-up payer signature is invalid", code="invalid-payload")
+        # The broadcast-failure rescue below resolves on ``signatures[0]``,
+        # so every required signature must verify, not just the payer's.
+        _verify_signers(raw, "top-up")
         try:
             sent = await rpc_client.send_raw_transaction(raw)
             signature = str(sent.value)
@@ -603,20 +630,33 @@ def new_top_up_tx_verifier(
             if status is None or status.get("err") is not None:
                 raise
             signature = landed
-        await confirm_transaction_signature(rpc_client, signature, "top-up")
+        # A confirmed top-up can still be forked out: credit only a finalized
+        # signature, against finalized channel state no older than its slot.
+        # Concurrent top-ups may raise the deposit further, so require >=.
+        slot = await confirm_transaction_signature(
+            rpc_client, signature, "top-up", commitment="finalized", timeout_seconds=60.0
+        )
+        if slot is None:
+            raise PaymentError("finalized top-up status carried no slot", code="transaction-not-confirmed")
         if amount > _U64_MAX - state.deposit:
             raise PaymentError("top-up deposit overflows u64", code="invalid-payload")
         await _verify_channel_account(
             rpc_client,
             state.channel_id,
             program_id=program_id,
-            expected={"deposit": state.deposit + amount},
+            expected={},
+            commitment="finalized",
+            min_context_slot=slot,
+            minimum_deposit=state.deposit + amount,
         )
 
     return verifier
 
 
 _U64_MAX = (1 << 64) - 1
+#: How long a slot-pinned channel read waits for a lagging RPC node.
+_SLOT_PINNED_READ_TIMEOUT_SECONDS = 30.0
+_SLOT_PINNED_READ_POLL_SECONDS = 1.0
 
 
 async def _verify_channel_account(
@@ -625,30 +665,60 @@ async def _verify_channel_account(
     *,
     program_id: Pubkey,
     expected: dict[str, Any],
+    commitment: Literal["confirmed", "finalized"] = "confirmed",
+    min_context_slot: int | None = None,
+    minimum_deposit: int | None = None,
 ) -> None:
-    """Fetch and compare the authoritative channel account after confirmation."""
-    from solana_pay_kit.protocols.programs.paymentchannels.accounts.channel import Channel
+    """Fetch and compare the authoritative channel account after confirmation.
 
-    response = await rpc_client.get_account_info(Pubkey.from_string(channel_id), commitment="confirmed")
+    With ``min_context_slot`` the read must come from a node at or past that
+    slot; a lagging node is re-polled until the deadline, then refused.
+    """
+    from solana_pay_kit._paycore.paymentchannels import decode_channel_account
+
+    deadline = time.monotonic() + _SLOT_PINNED_READ_TIMEOUT_SECONDS
+    while True:
+        response = await rpc_client.get_account_info(Pubkey.from_string(channel_id), commitment=commitment)
+        if min_context_slot is None:
+            break
+        context_slot = getattr(getattr(response, "context", None), "slot", None)
+        if not isinstance(context_slot, int):
+            raise PaymentError("channel read carried no context slot", code="transaction-not-confirmed")
+        if context_slot >= min_context_slot:
+            break
+        if time.monotonic() >= deadline:
+            raise PaymentError(
+                f"channel read at slot {context_slot} is behind transaction slot {min_context_slot}",
+                code="transaction-not-confirmed",
+            )
+        await asyncio.sleep(_SLOT_PINNED_READ_POLL_SECONDS)
     info = getattr(response, "value", None)
     if info is None:
         raise PaymentError("confirmed channel account was not found", code="transaction-not-found")
     if str(info.owner) != str(program_id):
         raise PaymentError("channel account is owned by the wrong program", code="invalid-payload")
-    channel = Channel.decode(bytes(info.data))
+    try:
+        channel = decode_channel_account(bytes(info.data))
+    except ValueError as exc:
+        raise PaymentError("invalid channel account data", code="invalid-payload") from exc
     actual = {
-        "authorized_signer": str(channel.authorizedSigner),
+        "authorized_signer": str(channel.authorized_signer),
         "deposit": channel.deposit,
-        "grace_period": channel.gracePeriod,
+        "grace_period": channel.grace_period,
         "mint": str(channel.mint),
-        "open_slot": channel.openSlot,
+        "open_slot": channel.open_slot,
         "payee": str(channel.payee),
         "payer": str(channel.payer),
-        "rent_payer": str(channel.rentPayer),
+        "rent_payer": str(channel.rent_payer),
         "salt": channel.salt,
     }
     if channel.status != 0:
         raise PaymentError("channel is not open after transaction confirmation", code="transaction-failed")
+    if minimum_deposit is not None and channel.deposit < minimum_deposit:
+        raise PaymentError(
+            "channel account deposit does not reflect the confirmed transaction",
+            code="transaction-failed",
+        )
     for field, value in expected.items():
         if actual[field] != value:
             raise PaymentError(
@@ -662,11 +732,12 @@ async def confirm_transaction_signature(
     signature: str,
     label: str,
     *,
+    commitment: Literal["confirmed", "finalized"] = "confirmed",
     timeout_seconds: float = 30.0,
     poll_interval_seconds: float = 1.0,
-) -> None:
+) -> int | None:
     """Poll ``getSignatureStatuses`` until ``signature`` reaches at least
-    ``confirmed`` commitment, or raise.
+    ``commitment``, or raise. Returns the status slot when the RPC reports one.
 
     ``label`` names the transaction in error messages ("open", "top-up",
     "settle"). A freshly broadcast signature commonly returns ``None`` from
@@ -703,17 +774,22 @@ async def confirm_transaction_signature(
                     f"{label} tx {signature!r} failed on-chain: {status['err']}", code="transaction-failed"
                 )
             level = status.get("confirmationStatus")
-            # RPC endpoints that omit ``confirmationStatus`` only report a
-            # status once the transaction has landed; treat that as
-            # confirmed, mirroring the TS helper.
-            if level is None or level in ("confirmed", "finalized"):
-                return
+            slot = status.get("slot")
+            slot = slot if isinstance(slot, int) else None
+            if commitment == "finalized":
+                if level == "finalized":
+                    return slot
+            elif level is None or level in ("confirmed", "finalized"):
+                # RPC endpoints that omit ``confirmationStatus`` only report a
+                # status once the transaction has landed; treat that as
+                # confirmed, mirroring the TS helper.
+                return slot
 
         now = time.monotonic()
         if now >= deadline:
             if saw_status:
                 raise PaymentError(
-                    f"{label} tx {signature!r} not confirmed within {timeout_seconds}s",
+                    f"{label} tx {signature!r} not {commitment} within {timeout_seconds}s",
                     code="transaction-not-confirmed",
                 )
             raise PaymentError(
@@ -726,7 +802,7 @@ async def confirm_transaction_signature(
 async def settle_and_seal_channel(
     state: ChannelState,
     *,
-    merchant: Keypair,
+    merchant: TransactionSigner,
     rpc: RpcClient,
     config: SessionConfig,
 ) -> str:
@@ -740,7 +816,7 @@ async def settle_and_seal_channel(
     """
     channel = Pubkey.from_string(state.channel_id)
     program_id = Pubkey.from_string(config.channel_program)
-    merchant_pubkey = merchant.pubkey()
+    merchant_pubkey = merchant.pubkey
 
     voucher_signature: bytes | None = None
     authorized_signer = merchant_pubkey
@@ -799,8 +875,8 @@ async def settle_and_seal_channel(
     )
 
     blockhash = Hash.from_string((await rpc.get_latest_blockhash()).value.blockhash)
-    tx = Transaction.new_signed_with_payer([*settle, distribute], merchant_pubkey, [merchant], blockhash)
-    sent = await rpc.send_raw_transaction(bytes(tx))
+    wire = await build_partially_signed_v0_transaction([*settle, distribute], merchant_pubkey, blockhash, merchant)
+    sent = await rpc.send_raw_transaction(wire)
     signature = str(sent.value)
     # Confirm before returning, mirroring cosign_and_broadcast_open: a dropped
     # settle tx (blockhash expiry, congestion, duplicate-settle race) must raise
@@ -810,7 +886,7 @@ async def settle_and_seal_channel(
     return signature
 
 
-async def cosign_and_broadcast_open(payload: OpenPayload, *, fee_payer: Any, rpc: RpcClient) -> str:
+async def cosign_and_broadcast_open(payload: OpenPayload, *, fee_payer: TransactionSigner, rpc: RpcClient) -> str:
     """Complete the fee-payer signature on a client-built open transaction and
     broadcast it.
 
@@ -826,8 +902,9 @@ async def cosign_and_broadcast_open(payload: OpenPayload, *, fee_payer: Any, rpc
             "server-funded open requires the client-built transaction in the payload",
             code="invalid-payload",
         )
-    cosigned = _co_sign_with_fee_payer(payload.transaction, fee_payer)
-    sent = await rpc.send_raw_transaction(base64.b64decode(cosigned))
+    cosigned = base64.b64decode(await _co_sign_with_fee_payer(payload.transaction, fee_payer))
+    _verify_signers(cosigned, "open")
+    sent = await rpc.send_raw_transaction(cosigned)
     signature = str(sent.value)
     await confirm_transaction_signature(rpc, signature, "open")
     return signature

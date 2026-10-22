@@ -9,7 +9,13 @@ each other.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Any
+
+from solana_keychain import TransactionSigner
+from solders.hash import Hash
+from solders.instruction import Instruction
+from solders.pubkey import Pubkey
+from solders.signature import Signature
+from solders.transaction import VersionedTransaction
 
 
 def _message_offset(raw: bytes) -> int | None:
@@ -76,36 +82,71 @@ def require_reported_version(version: object, error: Callable[[str], Exception] 
         raise error(f"transaction version {version!r} is not accepted; accepted versions: 0, 1")
 
 
-def build_partially_signed_v0_transaction(
-    instructions: Sequence[Any],
-    fee_payer: Any,
-    blockhash: Any,
-    signer_pubkey: Any,
-    sign: Callable[[bytes], bytes],
+class SignatureCheckError(ValueError):
+    """A wire transaction whose signatures do not authorize its message."""
+
+
+def verify_required_signatures(transaction: VersionedTransaction, *, unsigned: Pubkey | None = None) -> None:
+    """Refuse a transaction unless every required signer has signed its message.
+
+    The signature list must hold exactly ``header.num_required_signatures``
+    entries, one per required signer, and each must verify against the
+    account key in its slot over the exact signed message bytes. Checking only
+    the signatures present is not enough: a landed two-signer transaction cut
+    down to its first signature still verifies slot for slot, yet it names
+    the landed transaction, so a server that claimed it and then reconciled
+    on that signature's status would grant a payment it never received.
+
+    ``unsigned`` is the one key whose slot may still be the all-zero
+    placeholder: the server's own fee payer before it co-signs. Its slot must
+    still exist, and a non-placeholder signature in it must verify. Every
+    other slot must verify. Call this on the exact bytes that are claimed or
+    sent, before either.
+
+    Raises :class:`SignatureCheckError`; callers map it to their protocol's
+    reject code.
+    """
+    from solders.message import to_bytes_versioned  # type: ignore[import-untyped]
+
+    message = transaction.message
+    required = int(message.header.num_required_signatures)
+    signatures = list(transaction.signatures)
+    if required == 0 or len(signatures) != required:
+        raise SignatureCheckError(
+            f"transaction carries {len(signatures)} signatures but its message requires {required}"
+        )
+    account_keys = list(message.account_keys)
+    if len(account_keys) < required:
+        raise SignatureCheckError("transaction message lists fewer account keys than required signers")
+    signed_bytes = bytes(to_bytes_versioned(message))
+    placeholder = Signature.default()
+    for key, signature in zip(account_keys[:required], signatures, strict=True):
+        if unsigned is not None and key == unsigned and signature == placeholder:
+            continue
+        if not signature.verify(key, signed_bytes):
+            raise SignatureCheckError(f"signature for required signer {key} does not verify")
+
+
+async def build_partially_signed_v0_transaction(
+    instructions: Sequence[Instruction],
+    fee_payer: Pubkey,
+    blockhash: Hash,
+    signer: TransactionSigner,
 ) -> bytes:
-    """Compile a v0 message, sign only ``signer_pubkey``'s slot, return the wire.
+    """Compile a v0 transaction and sign it through solana-keychain.
 
     ``fee_payer`` becomes ``account_keys[0]``; every other required-signer slot
-    is left as the zero placeholder for a server-side cosign. The signature
-    covers ``to_bytes_versioned(message)`` (``0x80`` prefix + v0 body), which
-    is what the wire carries. Clients never build legacy ``Message`` encodings,
-    so every client path emits through here; servers still accept legacy from
-    pre-cutover clients.
+    is left as a zero placeholder for a server-side cosign. Transaction
+    signing does not require access to secret keys or raw-message signing,
+    so remote transaction-only signers use the same path as local signers.
     """
-    from solders.message import MessageV0, to_bytes_versioned  # type: ignore[import-untyped]
-    from solders.signature import Signature  # type: ignore[import-untyped]
-    from solders.transaction import VersionedTransaction  # type: ignore[import-untyped]
+    from solders.message import MessageV0  # type: ignore[import-untyped]
 
     message = MessageV0.try_compile(fee_payer, list(instructions), [], blockhash)
     num_required = int(message.header.num_required_signatures)
-    signer_keys = list(message.account_keys)[:num_required]
-    try:
-        signer_index = signer_keys.index(signer_pubkey)
-    except ValueError as exc:
-        raise ValueError("solana_pay_kit: signer is not a required signer of the transaction") from exc
-    sig = bytes(sign(bytes(to_bytes_versioned(message))))
-    if len(sig) != 64:
-        raise ValueError(f"solana_pay_kit: signature length {len(sig)}, want 64")
+    if signer.pubkey not in message.account_keys[:num_required]:
+        raise ValueError("solana_pay_kit: signer is not a required signer of the transaction")
     signatures = [Signature.default() for _ in range(num_required)]
-    signatures[signer_index] = Signature.from_bytes(sig)
-    return bytes(VersionedTransaction.populate(message, signatures))
+    transaction = VersionedTransaction.populate(message, signatures)
+    result = await signer.sign_transaction(transaction)
+    return bytes(result.transaction)

@@ -1,0 +1,278 @@
+language = "go"
+
+# Suites and vector intents this SDK claims. Unclaimed ones are shown
+# as "unclaimed" in the coverage table; they are never silently skipped.
+[capabilities]
+vector = ["charge", "x402-exact", "session"]
+protocol = true
+flow = false
+# Offline cross-verification: this SDK verifies every other SDK's saved builds
+# (`pkc run --cross --require`); cells are cross/<case>/<client>/<server>.
+cross = true
+# Interop roles (pkc run --tier interop), <protocol>:<scheme>:<role>; cases are interop/<scenario>/<client>/<server>.
+interop = ["mpp:charge:client", "mpp:charge:server", "x402:exact:client", "x402:exact:server", "x402:upto:client", "x402:upto:server"]
+# Whether the testee drives the SDK at the clock a vector pins; the runner drives the session voucher verifier at sessionVoucherVerify.nowSeconds.
+# Cross-checked against the testee `capabilities` op.
+honours_clock = true
+
+[[unsupported]]
+reason = "Go session wire types are on the superseded draft, not mpp-specs e702dd8: intents.OpenPayload carries recentSlot instead of openSlot and SignedVoucher nests the voucher under data instead of voucher (go/protocols/mpp/intents/session.go)"
+ids = [
+  "vector/session-wire-action-close-frozen",
+  "vector/session-wire-action-open-draft-slot-echo-reject",
+  "vector/session-wire-action-open-frozen",
+  "vector/session-wire-action-unknown-tag-reject",
+  "vector/session-wire-action-voucher-frozen",
+  "vector/session-wire-action-voucher-legacy-inner-data-reject",
+  "vector/session-wire-request-new-channel-frozen",
+  "vector/session-wire-request-resume-frozen",
+  "vector/session-wire-request-superseded-draft-reject",
+]
+
+[[known_failing]]
+id = "vector/x402-exact-verify-extra-required-signer-reject"
+reason = "the x402 exact verifier accepts a third required signer (scheme_exact_svm.md §2.1.4); go/protocols/x402/verify.go:81 never checks the header's signer set"
+tracking = "FINDINGS.md#x402-extra-required-signer-accepted"
+
+[[known_failing]]
+id = "vector/charge-build-sol-token-program-reject"
+reason = "the client builds a SOL charge whose challenge carries tokenProgram (go/protocols/mpp/client/charge.go:92)"
+tracking = "FINDINGS.md#charge-client-sol-token-program-ignored"
+
+[[known_failing]]
+id = "vector/charge-build-fee-payer-without-key-reject"
+reason = "feePayer=true without feePayerKey falls back to a client-paid transaction (go/protocols/mpp/client/charge.go:87)"
+tracking = "FINDINGS.md#charge-client-fee-payer-without-key"
+
+[[known_failing]]
+id = "vector/charge-build-unknown-network-reject"
+reason = "the client builds for network \"testnet\"; the network guard is opt-in (go/protocols/mpp/client/charge.go:327)"
+tracking = "FINDINGS.md#charge-client-unknown-network"
+
+[[known_failing]]
+id = "vector/charge-build-sol-ata-creation-required-reject"
+reason = "the client's SOL branch ignores ataCreationRequired (go/protocols/mpp/client/charge.go:92)"
+tracking = "FINDINGS.md#go-charge-sol-ata-creation-required"
+
+[[known_failing]]
+id = "vector/charge-verify-sol-ata-creation-required-reject"
+reason = "the server's native SOL branch ignores ataCreationRequired (go/protocols/mpp/server/server.go:757)"
+tracking = "FINDINGS.md#go-charge-sol-ata-creation-required"
+
+[[known_failing]]
+id = "vector/charge-verify-ata-for-top-level-recipient-reject"
+reason = "the ATA owner allowlist includes the top-level recipient (go/protocols/mpp/server/server.go:938)"
+tracking = "FINDINGS.md#go-charge-ata-owner-allowlist"
+
+[[known_failing]]
+id = "vector/charge-verify-sponsored-ata-top-level-reject"
+reason = "under feePayer=true the ATA owner allowlist includes the top-level recipient (go/protocols/mpp/server/server.go:938)"
+tracking = "FINDINGS.md#go-charge-ata-owner-allowlist"
+
+[[known_failing]]
+id = "vector/charge-verify-sponsored-ata-unmarked-split-reject"
+reason = "under feePayer=true the ATA owner allowlist includes splits without ataCreationRequired (go/protocols/mpp/server/server.go:938)"
+tracking = "FINDINGS.md#go-charge-ata-owner-allowlist"
+
+[[known_failing]]
+ids = [
+  "interop/charge-client-wrong-network/go/rust",
+]
+reason = "the client submits a credential for a challenge naming another cluster (draft-solana-charge-00: \"Clients MUST reject challenges whose network does not match their configured cluster\")"
+tracking = "FINDINGS.md#charge-client-network-not-checked"
+
+[[known_failing]]
+ids = [
+  "interop/charge-client-over-asking-price/go/rust",
+]
+reason = "the client pays a challenge whose amount was multiplied by 10000 after the server bound it; nothing checks the amount against what it was asked to pay (core: \"Clients MUST verify before authorizing payment\")"
+tracking = "FINDINGS.md#charge-client-request-not-verified"
+
+[[known_failing]]
+ids = [
+  "interop/charge-client-mis-signed-challenge/go/rust",
+]
+reason = "the client pays a challenge whose recipient was replaced after the server bound its id (core: \"Clients MUST verify before authorizing payment ... Recipient/address is expected\")"
+tracking = "FINDINGS.md#charge-client-request-not-verified"
+
+[[known_failing]]
+ids = [
+  "interop/charge-decimals-9/rust/go",
+]
+reason = "the server adapter does not serve a 9-decimal mint at the scenario amount"
+tracking = "FINDINGS.md#charge-decimals-9-servers"
+
+[[known_failing]]
+ids = [
+  "interop/charge-sol-native/rust/go",
+]
+reason = "the server adapter does not serve a native SOL charge"
+tracking = "FINDINGS.md#charge-sol-native-servers"
+
+[[known_failing]]
+ids = [
+  "interop/x402-exact-idempotent-resubmit/rust/go",
+]
+reason = "rejects a resubmitted payment without the canonical signature_consumed code"
+tracking = "FINDINGS.md#x402-canonical-codes"
+
+[[known_failing]]
+ids = [
+  "interop/x402-exact-client-wrong-network/go/rust",
+]
+reason = "the x402 client pays a requirement for solana mainnet while configured for the devnet CAIP-2 network"
+tracking = "FINDINGS.md#x402-client-network-not-checked"
+
+[[known_failing]]
+ids = [
+  "interop/x402-exact-cross-route-replay/rust/go",
+]
+reason = "the x402 server adapter does not mount MPP_HARNESS_REPLAY_SOURCE_PATH, so the cheap route a cross-route payment comes from does not exist"
+tracking = "FINDINGS.md#x402-replay-route-missing"
+
+# Transaction versions (SIMD-0385; mpp-specs-txv1, x402-txv1).
+
+[[unsupported]]
+reason = "unsupported-mode: Go session wire types are on the superseded draft, not mpp-specs e702dd8: intents.OpenPayload carries recentSlot instead of openSlot and SignedVoucher nests the voucher under data instead of voucher (go/protocols/mpp/intents/session.go)"
+ids = [
+  "vector/session-wire-transaction-versions-both-golden",
+  "vector/session-wire-transaction-versions-v1-only-golden",
+  "vector/session-wire-transaction-versions-v0-golden",
+  "vector/session-wire-transaction-versions-legacy-reject",
+  "vector/session-wire-transaction-versions-unknown-reject",
+  "vector/session-wire-transaction-versions-string-entry-reject",
+]
+
+[[known_failing]]
+ids = [
+  "vector/charge-wire-transaction-versions-both-golden",
+  "vector/charge-wire-transaction-versions-v1-only-golden",
+  "vector/charge-wire-transaction-versions-legacy-reject",
+  "vector/charge-wire-transaction-versions-unknown-reject",
+  "vector/charge-wire-transaction-versions-string-entry-reject",
+  "vector/charge-wire-transaction-versions-not-array-reject",
+  "vector/x402-wire-transaction-versions-golden",
+  "vector/x402-wire-transaction-versions-v1-only-golden",
+]
+reason = "the request types drop or mis-parse methodDetails/extra.transactionVersions (wire golden or reject): the Go SDK builds version 0 only (go/paycore/solanatx/solanatx.go NewV0Transaction), decodes legacy/version 0 only (solanatx.go DecodeTransaction refuses other version prefixes) and reads no transactionVersions"
+tracking = "FINDINGS.md#txv1-go"
+
+[[known_failing]]
+ids = [
+  "vector/charge-build-v1-advertised",
+  "vector/charge-build-v1-only-advertised",
+  "vector/charge-build-no-buildable-version-reject",
+  "vector/charge-build-empty-advertisement-reject",
+  "vector/charge-build-duplicate-advertisement",
+  "vector/charge-build-v1-sponsored",
+  "vector/charge-build-v1-sol",
+  "vector/charge-build-v1-large-memos",
+]
+reason = "the charge client ignores methodDetails.transactionVersions and builds version 0 (mpp-specs-txv1: \"Clients MUST build one of the advertised versions\"): the Go SDK builds version 0 only (go/paycore/solanatx/solanatx.go NewV0Transaction), decodes legacy/version 0 only (solanatx.go DecodeTransaction refuses other version prefixes) and reads no transactionVersions"
+tracking = "FINDINGS.md#txv1-go"
+
+[[known_failing]]
+ids = [
+  "vector/charge-verify-v1-advertised-accept",
+  "vector/charge-verify-v1-only-advertised-accept",
+  "vector/charge-verify-v1-not-advertised-reject",
+  "vector/charge-verify-v1-v0-only-reject",
+  "vector/charge-verify-v0-to-v1-only-reject",
+  "vector/charge-verify-legacy-reject",
+  "vector/charge-verify-legacy-default-reject",
+  "vector/charge-verify-lookup-table-reject",
+  "vector/charge-verify-v0-oversize-reject",
+  "vector/charge-verify-v1-large-memos-accept",
+  "vector/charge-verify-v1-compute-budget-instruction-reject",
+  "vector/charge-verify-v1-missing-compute-unit-limit-reject",
+  "vector/charge-verify-v1-missing-loaded-data-limit-reject",
+  "vector/charge-verify-v1-priority-fee-at-cap-accept",
+  "vector/charge-verify-v1-priority-fee-over-cap-reject",
+  "vector/charge-verify-v1-sponsored-priority-fee-at-cap-accept",
+  "vector/charge-verify-v1-sponsored-priority-fee-over-cap-reject",
+  "vector/charge-verify-v1-reduced-limit-price-reject",
+  "vector/charge-verify-v1-underpay-reject",
+  "vector/charge-verify-v1-wrong-recipient-reject",
+  "vector/charge-verify-v1-wrong-mint-reject",
+  "vector/charge-verify-v1-sol-underpay-reject",
+  "vector/charge-verify-v1-unexpected-instruction-reject",
+  "vector/charge-verify-v1-sponsor-as-authority-reject",
+]
+reason = "the charge verifier has no version admission or version-1 rules (mpp-specs-txv1 Transaction Versions): the Go SDK builds version 0 only (go/paycore/solanatx/solanatx.go NewV0Transaction), decodes legacy/version 0 only (solanatx.go DecodeTransaction refuses other version prefixes) and reads no transactionVersions"
+tracking = "FINDINGS.md#txv1-go"
+
+[[known_failing]]
+ids = [
+  "vector/x402-build-v1-advertised",
+  "vector/x402-build-duplicate-advertisement",
+  "vector/x402-build-no-intersection-reject",
+  "vector/x402-build-empty-advertisement-reject",
+  "vector/x402-build-legacy-only-reject",
+  "vector/x402-verify-v1-accept",
+  "vector/x402-verify-v1-not-accepted-reject",
+  "vector/x402-verify-v1-explicit-v0-sponsor-reject",
+  "vector/x402-verify-v1-over-1232-accept",
+  "vector/x402-verify-v0-over-1232-reject",
+  "vector/x402-verify-v1-compute-limit-at-cap-accept",
+  "vector/x402-verify-v1-compute-limit-over-cap-reject",
+  "vector/x402-verify-v1-priority-fee-at-cap-accept",
+  "vector/x402-verify-v1-priority-fee-over-cap-reject",
+  "vector/x402-verify-v1-too-many-instructions-reject",
+  "vector/x402-verify-v1-underpay-reject",
+  "vector/x402-verify-v1-wrong-recipient-reject",
+  "vector/x402-verify-v1-wrong-mint-reject",
+  "vector/x402-verify-v1-decimals-reject",
+  "vector/x402-verify-v1-fee-payer-authority-reject",
+  "vector/x402-verify-v1-fee-payer-in-accounts-reject",
+  "vector/x402-verify-v1-extra-signer-reject",
+]
+reason = "the x402 exact client and sponsor have no transaction-version support (scheme_exact_svm.md §1.5, x402-foundation/x402 PR 3473/3474): the Go SDK builds version 0 only (go/paycore/solanatx/solanatx.go NewV0Transaction), decodes legacy/version 0 only (solanatx.go DecodeTransaction refuses other version prefixes) and reads no transactionVersions"
+tracking = "FINDINGS.md#txv1-go"
+
+# Cross-verification of the transaction-version builds.
+
+[[known_failing]]
+ids = [
+  "cross/charge-build-duplicate-advertisement/go/go",
+  "cross/charge-build-duplicate-advertisement/python/go",
+  "cross/charge-build-duplicate-advertisement/swift/go",
+  "cross/charge-build-duplicate-advertisement/typescript/go",
+  "cross/charge-build-v1-large-memos/go/go",
+  "cross/charge-build-v1-large-memos/python/go",
+  "cross/charge-build-v1-large-memos/swift/go",
+  "cross/charge-build-v1-large-memos/typescript/go",
+  "cross/charge-build-v1-only-advertised/go/go",
+  "cross/charge-build-v1-only-advertised/python/go",
+  "cross/charge-build-v1-only-advertised/swift/go",
+  "cross/charge-build-v1-only-advertised/typescript/go",
+]
+reason = "accepts a version-0 charge build the Rust verifier refuses: version 0 for a challenge advertising [1] only, or over the 1232-byte version-0 limit (mpp-specs-txv1 Transaction Versions)"
+tracking = "FINDINGS.md#txv1-go"
+
+[[known_failing]]
+ids = [
+  "cross/charge-build-duplicate-advertisement/rust/go",
+  "cross/charge-build-v1-advertised/rust/go",
+  "cross/charge-build-v1-large-memos/rust/go",
+  "cross/charge-build-v1-only-advertised/rust/go",
+  "cross/charge-build-v1-sol/rust/go",
+  "cross/charge-build-v1-sponsored/rust/go",
+]
+reason = "refuses a valid version-1 charge build (the Rust kit's, or another SDK's that the Rust judge accepts): the verifier cannot decode or admit version 1"
+tracking = "FINDINGS.md#txv1-go"
+
+[[known_failing]]
+ids = [
+  "cross/x402-build-duplicate-advertisement/rust/go",
+  "cross/x402-build-v1-advertised/rust/go",
+]
+reason = "refuses a valid version-1 x402 build: the verifier cannot decode or admit version 1"
+tracking = "FINDINGS.md#txv1-go"
+
+[[unsupported]]
+reason = "the runner's session verify path drives only the SDK's voucher verifier (input.sessionVoucherVerify); it has no path to the session server's open checks (input.sessionOpenVerify)"
+pattern = "vector/session-open-*"
+[[known_failing]]
+id = "vector/x402-exact-verify-priority-fee-over-cap-reject"
+reason = "the x402 exact verifier caps the unit price alone (go/protocols/x402/verify.go:21), so the 200,000 unit limit at 5,000,000 micro-lamports per unit (a 1,000,000 lamport priority fee) is sponsored (RULINGS S6)"
+tracking = "FINDINGS.md#x402-priority-fee-product-uncapped"

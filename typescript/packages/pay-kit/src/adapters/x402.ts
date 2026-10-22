@@ -1,4 +1,5 @@
 import { createSolanaRpc } from '@solana/kit';
+import { claimConsumedSignature } from '@solana/mpp/server';
 import { x402Facilitator } from '@x402/core/facilitator';
 import {
     decodePaymentSignatureHeader,
@@ -16,7 +17,9 @@ import type { PayKitConfig } from '../config.js';
 import { InvalidProofError } from '../errors.js';
 import type { Gate } from '../gate.js';
 import type { Payment } from '../payment.js';
+import { paymentIdentifierDeclaration, readPaymentIdentifier } from '../payment-identifier.js';
 import { caip2 } from '../protocol.js';
+import { verifyX402ExactCredential } from './x402-exact-verify.js';
 import { errorMessage, x402PaymentHeader } from './x402-shared.js';
 
 /** x402 v2 protocol version advertised in the challenge envelope. */
@@ -112,6 +115,7 @@ export function createX402ExactAdapter(config: PayKitConfig): ProtocolAdapter {
                 // a pathname-only value fails that validation behind a proxy.
                 resource: { url: request.url },
                 x402Version: X402_VERSION,
+                ...(gate.paymentIdentifier && { extensions: paymentIdentifierDeclaration(gate.paymentIdentifier) }),
             };
             return { [PAYMENT_REQUIRED_HEADER]: encodePaymentRequiredHeader(paymentRequired) };
         },
@@ -133,8 +137,25 @@ export function createX402ExactAdapter(config: PayKitConfig): ProtocolAdapter {
             } catch (error) {
                 throw new InvalidProofError('invalid_x402_payment_header', errorMessage(error));
             }
+            // The header is client-controlled: reject what the v2 facilitator
+            // cannot take as a 402 (x402 v2 §9 error codes) instead of letting
+            // it throw out of `verify` as a server error.
+            if (payload?.x402Version !== X402_VERSION) {
+                throw new InvalidProofError(
+                    'invalid_x402_version',
+                    `Unsupported x402 version: ${String(payload?.x402Version)}`,
+                );
+            }
+            if (payload.accepted === null || typeof payload.accepted !== 'object') {
+                throw new InvalidProofError('invalid_payload', 'x402 v2 payment payload is missing `accepted`');
+            }
+            // Before any chain work: a missing or malformed id is a 400.
+            if (gate.paymentIdentifier) readPaymentIdentifier(payload.extensions, gate.paymentIdentifier);
 
             const requirements = requirementsFor(gate);
+            // Bind `accepted` to this route and keep the fee payer out of every
+            // instruction (§2.1.1) before the facilitator, which checks neither.
+            verifyX402ExactCredential(payload, requirements);
             const verification = await facilitator.verify(payload, requirements);
             if (!verification.isValid) {
                 throw new InvalidProofError(verification.invalidReason ?? 'invalid_proof', verification.invalidMessage);
@@ -143,6 +164,13 @@ export function createX402ExactAdapter(config: PayKitConfig): ProtocolAdapter {
             const settlement = await facilitator.settle(payload, requirements);
             if (!settlement.success) {
                 throw new InvalidProofError(settlement.errorReason ?? 'settlement_failed', settlement.errorMessage);
+            }
+            // One on-chain payment authorizes one request across protocols.
+            // The facilitator re-sends without preflight, so a transaction
+            // already settled through MPP "settles" again here under the same
+            // signature; the shared ledger is what refuses it.
+            if (!(await claimConsumedSignature(config.replayStore, settlement.transaction))) {
+                throw new InvalidProofError('signature_consumed', 'Transaction signature already consumed');
             }
 
             return {

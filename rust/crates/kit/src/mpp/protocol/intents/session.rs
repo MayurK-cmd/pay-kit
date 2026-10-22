@@ -177,6 +177,12 @@ pub struct SessionRequest {
 pub struct SessionMethodDetails {
     pub network: String,
     pub channel_program: String,
+    /// Channel account/instruction ABI. Absent means V1, not auto-detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_version: Option<u8>,
+    /// Immutable lifecycle callbacks approved when opening a V2 channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_hooks: Option<crate::core::payment_channels_v2::ChannelHooks>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
     /// Base58 blockhash the client MUST use as the open transaction's recent
@@ -459,6 +465,32 @@ impl MeteringDirective {
     pub fn amount_base_units(&self) -> crate::mpp::error::Result<u64> {
         self.amount.parse().map_err(|_| {
             crate::mpp::error::Error::Other(format!("invalid metering amount: {}", self.amount))
+        })
+    }
+
+    /// The directive to commit once the stream reports its final `usage`.
+    ///
+    /// The usage must name this delivery and stay within the reserved amount;
+    /// the result is what a client signs a voucher for, so an endpoint can
+    /// never raise the charge past the reservation by reporting more usage.
+    pub fn settle(&self, usage: &MeteringUsage) -> crate::mpp::error::Result<Self> {
+        use crate::mpp::error::Error;
+        if usage.delivery_id != self.delivery_id {
+            return Err(Error::Other(format!(
+                "usage delivery {} does not match directive {}",
+                usage.delivery_id, self.delivery_id
+            )));
+        }
+        let reserved = self.amount_base_units()?;
+        let used = usage.amount_base_units()?;
+        if used > reserved {
+            return Err(Error::Other(format!(
+                "mpp.usage amount {used} exceeds the reserved metering amount {reserved}"
+            )));
+        }
+        Ok(Self {
+            amount: used.to_string(),
+            ..self.clone()
         })
     }
 }

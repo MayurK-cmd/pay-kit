@@ -6,7 +6,9 @@
 //! use crate::mpp::server::Mpp;
 //!
 //! let mpp = Mpp::new(crate::mpp::server::Config {
+//!     realm: Some("test-realm".to_string()),
 //!     recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
+//!     store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
 //!     ..Default::default()
 //! })?;
 //!
@@ -49,7 +51,8 @@ use crate::mpp::protocol::solana::{
     default_rpc_url, programs, CredentialPayload, MethodDetails, Split, MAX_MEMO_BYTES,
 };
 use crate::mpp::store::{
-    ChargeReplayStore, ChargeReservation, MemoryStore, Store, CHARGE_RESERVATION_LEASE,
+    ChargeReplayStore, ChargeReservation, Store, CHARGE_RESERVATION_LEASE,
+    DEFAULT_CHARGE_RECORD_RETENTION,
 };
 
 const SECRET_KEY_ENV_VAR: &str = "MPP_SECRET_KEY";
@@ -71,27 +74,6 @@ pub(crate) const MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 5_000_000;
 pub(crate) const MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS_FEE_SPONSORED: u64 = 10_000;
 const SIMULATION_MAX_ATTEMPTS: usize = 3;
 const SIMULATION_RETRY_DELAY_MS: u64 = 400;
-
-/// Audit #15: derive a per-app default realm from the recipient pubkey.
-///
-/// `realm` is part of the HMAC ID input. With a fixed default of
-/// `"MPP Payment"`, two services that shared `MPP_SECRET_KEY` and both
-/// kept the default would participate in one shared credential namespace,
-/// enabling cross-service credential replay. Deriving from `recipient`
-/// (a Solana pubkey, unique per merchant) means two services with the
-/// same secret but different recipients automatically get different
-/// realms, so cross-service replay fails at HMAC verification.
-///
-/// Format: `"App Id - #<8-digit decimal>"`. Decimal is `u32::from_be_bytes`
-/// over the first 4 bytes of `SHA-256(recipient)`, modulo 10^8 for a
-/// compact display. Deterministic for a given recipient.
-fn derive_default_realm(recipient: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(recipient.as_bytes());
-    let first_four = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
-    let app_id = first_four % 100_000_000;
-    format!("App Id - #{app_id}")
-}
 
 /// Minimum length, in bytes, for the HMAC-SHA256 key used to bind
 /// challenge IDs. NIST SP 800-107 recommends a key at least as long as
@@ -132,12 +114,38 @@ fn validate_challenge_binding_secret(secret: &str) -> Result<(), Error> {
 /// answer comes from the static table; for an arbitrary mint address the
 /// owner is fetched on-chain and validated, per spec §7.2 (rather than
 /// silently falling back to the legacy Token Program).
+/// True when the configured currency is native SOL (any case).
+fn currency_is_native_sol(currency: &str) -> bool {
+    currency.eq_ignore_ascii_case("SOL")
+}
+
+/// The wire `currency` for a configured one. Spec: "For native SOL, MUST be
+/// the lowercase string `"sol"`. For SPL tokens, MUST be the base58-encoded
+/// mint address." A symbol (`USDC`, `SOL`, ...) is configuration input only
+/// and is resolved for `network` here, before anything reaches the wire.
+pub(crate) fn wire_currency(currency: &str, network: &str) -> Result<String, Error> {
+    if currency_is_native_sol(currency) {
+        return Ok(NATIVE_SOL_CURRENCY.to_string());
+    }
+    let mint = crate::mpp::protocol::solana::try_resolve_stablecoin_mint(currency, Some(network))?
+        .unwrap_or(currency);
+    Pubkey::from_str(mint).map_err(|e| {
+        Error::InvalidConfig(format!(
+            "Currency {currency} is neither a known symbol nor a valid mint address: {e}"
+        ))
+    })?;
+    Ok(mint.to_string())
+}
+
+/// Wire `currency` for native SOL.
+pub const NATIVE_SOL_CURRENCY: &str = "sol";
+
 fn resolve_server_token_program(
     rpc: &RpcClient,
     currency: &str,
     network: Option<&str>,
 ) -> Result<Option<&'static str>, Error> {
-    if currency.eq_ignore_ascii_case("SOL") {
+    if currency_is_native_sol(currency) {
         return Ok(None);
     }
 
@@ -185,6 +193,15 @@ fn resolve_server_token_program(
 
 // ── Configuration ──
 
+/// Explicit channel-charge signing and callback policy. The payee is the fee
+/// sponsor when sponsored, otherwise the economic recipient. This is independent
+/// of the message-only confidential `recipient_signer`.
+#[derive(Clone)]
+pub struct ChannelChargeConfig {
+    pub payee_signer: Arc<dyn solana_keychain::TransactionSigner>,
+    pub hooks: crate::core::payment_channel::v2::ChannelHooks,
+}
+
 /// Server configuration.
 #[derive(Clone)]
 pub struct Config {
@@ -207,26 +224,43 @@ pub struct Config {
     /// rejected at `Mpp::new` time. If `None`, the value is read from the
     /// `MPP_SECRET_KEY` environment variable.
     pub challenge_binding_secret: Option<String>,
-    /// Server realm.
+    /// Server realm: the credential namespace, part of every challenge's HMAC.
+    /// REQUIRED — stable across replicas of one service and distinct across
+    /// services, so credentials cannot cross between services that share a
+    /// recipient and secret.
     pub realm: Option<String>,
     /// Whether server pays transaction fees.
     pub fee_payer: bool,
     /// Fee payer signer (if fee_payer is true).
     pub fee_payer_signer: Option<Arc<dyn solana_keychain::TransactionSigner>>,
+    /// Opt-in only; direct-transfer challenges remain the default.
+    pub channel_charge: Option<ChannelChargeConfig>,
     /// Payee (recipient) wallet signer, used to derive the recipient ElGamal
     /// key for confidential-transfer settlement. Two settlement modes:
     ///   * `Some` (recipient-key verification): the gateway controls the payee,
     ///     so it derives the recipient key and ENFORCES the exact amount by
-    ///     decrypting the recipient's own pending-balance delta (NOT auditor).
-    ///   * `None` (facilitator trust-proofs): the gateway settles to an
-    ///     arbitrary recipient it cannot decrypt, so confidential bundles are
-    ///     ACCEPTED without amount enforcement — it only verifies the transfer
-    ///     targets the recipient and lands (the on-chain ZK program guarantees
-    ///     the proofs), and the recipient reconciles the amount out of band.
+    ///     decrypting the transfer's recipient ciphertext (NOT auditor).
+    ///   * `None` (facilitator): the gateway settles to an arbitrary recipient
+    ///     it cannot decrypt. The amount is then enforced with
+    ///     `confidential_auditor` when set; otherwise bundles are rejected
+    ///     unless `accept_unverified_confidential_amount` opts in.
     ///
     /// Not used for non-confidential flows.
     pub recipient_signer: Option<Arc<dyn solana_keychain::SolanaSigner>>,
-    /// Replay protection store (defaults to in-memory).
+    /// The mint's auditor ElGamal keypair (64 bytes, `pubkey || secret`, as
+    /// `solana-zk-keygen` writes it). Lets a facilitator (no
+    /// `recipient_signer`) enforce the exact amount by decrypting the
+    /// transfer's auditor ciphertext.
+    pub confidential_auditor: Option<[u8; 64]>,
+    /// Accept confidential bundles whose amount this server cannot decrypt
+    /// (no `recipient_signer`, no `confidential_auditor`). Receipts then attest
+    /// only that a transfer to the recipient landed, not its amount; the
+    /// recipient must reconcile out of band. Off by default.
+    pub accept_unverified_confidential_amount: bool,
+    /// Replay protection store. REQUIRED: the challenge ledger must be one
+    /// long-lived instance shared by every `Mpp` that verifies the same
+    /// challenges (requests, replicas, restarts); a per-instance store lets a
+    /// credential settle once per instance.
     pub store: Option<Arc<dyn Store>>,
     /// Enable HTML payment link pages for browser requests.
     pub html: bool,
@@ -258,7 +292,10 @@ impl Default for Config {
             realm: None,
             fee_payer: false,
             fee_payer_signer: None,
+            channel_charge: None,
             recipient_signer: None,
+            confidential_auditor: None,
+            accept_unverified_confidential_amount: false,
             store: None,
             html: false,
             accept_push_mode: false,
@@ -275,6 +312,12 @@ pub struct ChargeOptions<'a> {
     pub fee_payer: bool,
     /// Resolved payment splits to embed in `methodDetails.splits`.
     pub splits: Vec<crate::mpp::protocol::solana::Split>,
+    /// Server-side identity of the protected route (e.g. method, host, and
+    /// path). Bound into the challenge's HMAC-covered `opaque` and never put
+    /// on chain; verify with [`Mpp::verify_credential_for_route`] so a
+    /// credential issued for one route cannot be spent on another with equal
+    /// payment terms.
+    pub route: Option<&'a str>,
 }
 
 // ── Mpp handler ──
@@ -304,14 +347,20 @@ pub struct Mpp {
     pub(crate) network: String,
     pub(crate) fee_payer: bool,
     pub(crate) fee_payer_signer: Option<Arc<dyn solana_keychain::TransactionSigner>>,
+    pub(crate) channel_charge: Option<ChannelChargeConfig>,
     /// Payee wallet signer for confidential-transfer recipient-key
     /// verification (derives the recipient ElGamal key). `Some` ⇒ enforce the
-    /// exact amount via the recipient's pending-balance delta; `None` ⇒
-    /// facilitator trust-proofs mode, where bundles are accepted WITHOUT amount
-    /// enforcement (the recipient reconciles out of band). See [`Config`].
+    /// exact amount via the transfer's recipient ciphertext; `None` ⇒
+    /// facilitator mode (auditor-key enforcement or explicit opt-in). See
+    /// [`Config`].
     // Only read by the confidential bundle-settlement path.
     #[cfg_attr(not(feature = "confidential"), allow(dead_code))]
     pub(crate) recipient_signer: Option<Arc<dyn solana_keychain::SolanaSigner>>,
+    #[cfg(feature = "confidential")]
+    pub(crate) confidential_auditor:
+        Option<Arc<solana_zk_sdk::encryption::elgamal::ElGamalKeypair>>,
+    #[cfg_attr(not(feature = "confidential"), allow(dead_code))]
+    pub(crate) accept_unverified_confidential_amount: bool,
     pub(crate) store: Arc<dyn Store>,
     pub(crate) html: bool,
     /// Audit #5: opt-in for push-mode credentials.
@@ -345,6 +394,17 @@ impl Mpp {
         // format canonical and stops the silent "everything unknown
         // defaults to mainnet" behaviour that used to live in default_rpc_url.
         crate::mpp::protocol::solana::validate_network(&config.network)?;
+        if let Some(channel) = &config.channel_charge {
+            let program =
+                Pubkey::from_str(crate::core::payment_channel::v2::PAYMENT_CHANNELS_PROGRAM_ID)
+                    .map_err(|error| Error::InvalidConfig(error.to_string()))?;
+            crate::mpp::program::channel_deployment::resolve_for_network(
+                program,
+                Some(2),
+                Some(&channel.hooks),
+                &config.network,
+            )?;
+        }
 
         let rpc_url = config
             .rpc_url
@@ -354,19 +414,33 @@ impl Mpp {
             .map_or_else(detect_challenge_binding_secret, Ok)?;
         validate_challenge_binding_secret(&challenge_binding_secret)?;
         let realm = match config.realm {
-            Some(r) if r.is_empty() => {
+            Some(r) if !r.is_empty() => r,
+            _ => {
                 return Err(Error::InvalidConfig(
-                    "Config.realm must be non-empty when provided".into(),
+                    "Config.realm is required: set a non-empty realm unique to this service".into(),
                 ));
             }
-            Some(r) => r,
-            None => derive_default_realm(&config.recipient),
         };
-        let store: Arc<dyn Store> = config.store.unwrap_or_else(|| Arc::new(MemoryStore::new()));
+        let store: Arc<dyn Store> = config.store.ok_or_else(|| {
+            Error::InvalidConfig(
+                "Config.store is required: pass the replay store shared by every verifier".into(),
+            )
+        })?;
+        #[cfg(feature = "confidential")]
+        let confidential_auditor = config
+            .confidential_auditor
+            .map(|bytes| {
+                solana_zk_sdk::encryption::elgamal::ElGamalKeypair::try_from(bytes.as_slice())
+                    .map(Arc::new)
+                    .map_err(|e| {
+                        Error::InvalidConfig(format!("Invalid confidential_auditor keypair: {e}"))
+                    })
+            })
+            .transpose()?;
 
         let rpc = Arc::new(RpcClient::new(rpc_url.clone()));
-        let token_program =
-            resolve_server_token_program(&rpc, &config.currency, Some(&config.network))?;
+        let currency = wire_currency(&config.currency, &config.network)?;
+        let token_program = resolve_server_token_program(&rpc, &currency, Some(&config.network))?;
 
         Ok(Mpp {
             // Version 0 only until the host opts in with `with_tx_v1`; no RPC call here.
@@ -375,14 +449,18 @@ impl Mpp {
             rpc_url,
             realm,
             challenge_binding_secret,
-            currency: config.currency,
+            currency,
             token_program,
             recipient: config.recipient,
             decimals: config.decimals as u32,
             network: config.network,
             fee_payer: config.fee_payer,
             fee_payer_signer: config.fee_payer_signer,
+            channel_charge: config.channel_charge,
             recipient_signer: config.recipient_signer,
+            #[cfg(feature = "confidential")]
+            confidential_auditor,
+            accept_unverified_confidential_amount: config.accept_unverified_confidential_amount,
             store,
             html: config.html,
             accept_push_mode: config.accept_push_mode,
@@ -417,6 +495,8 @@ impl Mpp {
         &self.realm
     }
 
+    /// The wire currency this server issues: `"sol"` or a mint address,
+    /// resolved from [`Config::currency`].
     pub fn currency(&self) -> &str {
         &self.currency
     }
@@ -469,6 +549,30 @@ impl Mpp {
         credential_str: &str,
         amount: &str,
     ) -> Result<Receipt, VerificationError> {
+        self.verify_payment_bound(credential_str, amount, None)
+            .await
+    }
+
+    /// [`verify_payment_for_amount`](Self::verify_payment_for_amount) for a
+    /// challenge issued with [`ChargeOptions::route`]: the credential's
+    /// authenticated route must also equal `route`, so a credential paid at
+    /// one route (or host) cannot be spent at another with equal terms.
+    pub async fn verify_payment_for_route(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        route: &str,
+    ) -> Result<Receipt, VerificationError> {
+        self.verify_payment_bound(credential_str, amount, Some(route))
+            .await
+    }
+
+    async fn verify_payment_bound(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        route: Option<&str>,
+    ) -> Result<Receipt, VerificationError> {
         let credential = crate::mpp::protocol::core::headers::parse_authorization(credential_str)
             .map_err(|e| {
             VerificationError::new(format!("Failed to parse Authorization: {e}"))
@@ -479,8 +583,7 @@ impl Mpp {
         let expected: ChargeRequest = challenge.request.decode().map_err(|e| {
             VerificationError::new(format!("Failed to decode expected request: {e}"))
         })?;
-        self.verify_credential_with_expected(&credential, &expected)
-            .await
+        self.verify_bound(&credential, &expected, route).await
     }
 
     /// Generate a charge challenge with additional options.
@@ -488,6 +591,15 @@ impl Mpp {
         &self,
         amount: &str,
         options: ChargeOptions<'_>,
+    ) -> Result<PaymentChallenge, Error> {
+        self.charge_with_context(amount, options, None)
+    }
+
+    fn charge_with_context(
+        &self,
+        amount: &str,
+        options: ChargeOptions<'_>,
+        context: Option<crate::core::blockhash::CachedBlockhash>,
     ) -> Result<PaymentChallenge, Error> {
         self.validate_charge_options(&options)?;
         let base_units = crate::mpp::protocol::intents::parse_units(amount, self.decimals as u8)?;
@@ -504,7 +616,12 @@ impl Mpp {
         // Build Solana-specific method details.
         let mut details = serde_json::Map::new();
         details.insert("network".into(), serde_json::json!(self.network));
-        details.insert("decimals".into(), serde_json::json!(self.decimals));
+        // Spec: `decimals` "MUST be present when `currency` is a mint address;
+        // MUST be absent when `currency` is `"sol"`" (`tokenProgram` likewise
+        // stays unset for SOL; see `resolve_server_token_program`).
+        if !currency_is_native_sol(&self.currency) {
+            details.insert("decimals".into(), serde_json::json!(self.decimals));
+        }
 
         if options.fee_payer || self.fee_payer {
             details.insert("feePayer".into(), serde_json::json!(true));
@@ -541,10 +658,11 @@ impl Mpp {
         // and emitting it only on a cache hit would make the field flicker in
         // and out of the challenge depending on cache warmth. The x402 paths,
         // which already commit to the field, forward it; MPP does not.
-        let blockhash = match self.blockhash_cache.as_ref().and_then(|c| c.get()) {
-            Some(cached) => Some(cached.blockhash),
-            None => self.rpc.get_latest_blockhash().ok().map(|h| h.to_string()),
-        };
+        let blockhash =
+            match context.or_else(|| self.blockhash_cache.as_ref().and_then(|c| c.get())) {
+                Some(cached) => Some(cached.blockhash),
+                None => self.rpc.get_latest_blockhash().ok().map(|h| h.to_string()),
+            };
         if let Some(blockhash) = blockhash {
             details.insert("recentBlockhash".into(), serde_json::json!(blockhash));
         }
@@ -560,6 +678,8 @@ impl Mpp {
         let encoded = Base64UrlJson::from_typed(&request)?;
         let default_expires = crate::mpp::expires::minutes(5);
         let expires = options.expires.unwrap_or(&default_expires);
+        self.check_push_replay_window(expires)?;
+        let opaque = options.route.map(route_opaque).transpose()?;
 
         Ok(PaymentChallenge::with_challenge_binding_secret_full(
             &self.challenge_binding_secret,
@@ -570,7 +690,7 @@ impl Mpp {
             Some(expires),
             None,
             options.description,
-            None,
+            opaque,
         ))
     }
 
@@ -653,6 +773,116 @@ impl Mpp {
         self.charge_challenge_with_options(request, None, None)
     }
 
+    /// Whether an explicit channel-charge signing policy is configured.
+    pub fn channel_charge_enabled(&self) -> bool {
+        self.channel_charge.is_some()
+    }
+
+    /// Issue a first-response channel charge without knowing the payer identity.
+    /// Reuses ordinary pricing/sponsor fields; adds only V2 policy and recent slot.
+    pub fn charge_channel_with_options(
+        &self,
+        amount: &str,
+        options: ChargeOptions<'_>,
+    ) -> Result<PaymentChallenge, Error> {
+        let config = self
+            .channel_charge
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfig("channel charges are disabled".into()))?;
+        let context = self
+            .blockhash_cache
+            .as_ref()
+            .and_then(|cache| cache.get())
+            .map(Ok)
+            .unwrap_or_else(|| {
+                crate::core::blockhash::fetch_blockhash_with_slot(
+                    &self.rpc,
+                    solana_commitment_config::CommitmentConfig::confirmed(),
+                )
+            })
+            .map_err(Error::Rpc)?;
+        let base = self.charge_with_context(amount, options, Some(context.clone()))?;
+        let mut request: ChargeRequest = base.request.decode()?;
+        let mut details: MethodDetails =
+            serde_json::from_value(request.method_details.take().unwrap_or_default())
+                .map_err(|e| Error::InvalidConfig(e.to_string()))?;
+        details.recent_blockhash = Some(context.blockhash);
+        details.transaction_versions = Some(self.accepted_versions.clone());
+        details.channel_charge = Some(crate::mpp::protocol::channel_charge::ChannelChargeProfile {
+            channel_program: crate::core::payment_channel::v2::PAYMENT_CHANNELS_PROGRAM_ID.into(),
+            channel_version: 2,
+            channel_hooks: config.hooks.clone(),
+            recent_slot: context.slot,
+        });
+        request.method_details =
+            Some(serde_json::to_value(details).map_err(|e| Error::InvalidConfig(e.to_string()))?);
+        self.validate_charge_request(&request)?;
+        Ok(PaymentChallenge::with_challenge_binding_secret_full(
+            &self.challenge_binding_secret,
+            &self.realm,
+            METHOD_NAME,
+            "charge",
+            Base64UrlJson::from_typed(&request)?,
+            base.expires.as_deref(),
+            None,
+            None,
+            base.opaque,
+        ))
+    }
+
+    fn validate_channel_policy(
+        &self,
+        request: &ChargeRequest,
+        md: &MethodDetails,
+    ) -> Result<(), Error> {
+        let Some(profile) = &md.channel_charge else {
+            return Ok(());
+        };
+        let config = self
+            .channel_charge
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfig("channel charges are disabled".into()))?;
+        if profile.channel_hooks != config.hooks {
+            return Err(Error::InvalidConfig(
+                "channel charge hook policy mismatch".into(),
+            ));
+        }
+        let payee = if md.fee_payer == Some(true) {
+            let signer = self
+                .fee_payer_signer
+                .as_ref()
+                .ok_or_else(|| Error::InvalidConfig("channel charge sponsor missing".into()))?;
+            if md.fee_payer_key.as_deref() != Some(signer.pubkey().to_string().as_str()) {
+                return Err(Error::InvalidConfig(
+                    "channel charge sponsor mismatch".into(),
+                ));
+            }
+            signer.pubkey().to_string()
+        } else {
+            self.recipient.clone()
+        };
+        if config.payee_signer.pubkey().to_string() != payee
+            || request.recipient.as_deref() != Some(self.recipient.as_str())
+            || md.network.as_deref() != Some(self.network.as_str())
+            || md.token_program.as_deref() != self.token_program
+        {
+            return Err(Error::InvalidConfig(
+                "channel charge server policy mismatch".into(),
+            ));
+        }
+        // Validate economics/deployment without consuming a client identity.
+        // The actual client-owned identities are authenticated at settlement.
+        crate::mpp::protocol::channel_charge::terms(
+            request,
+            md,
+            "2099-01-01T00:00:00Z",
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            0,
+        )?;
+        Ok(())
+    }
+
     /// Generate a charge challenge from a full request with options.
     ///
     /// The override-point on the high-level `charge_with_options` path:
@@ -670,10 +900,12 @@ impl Mpp {
         expires: Option<&str>,
         description: Option<&str>,
     ) -> Result<PaymentChallenge, Error> {
-        self.validate_charge_request(request)?;
-        let encoded = Base64UrlJson::from_typed(request)?;
+        let request = self.with_wire_currency(request);
+        self.validate_charge_request(&request)?;
+        let encoded = Base64UrlJson::from_typed(&*request)?;
         let default_expires = crate::mpp::expires::minutes(5);
         let expires = expires.unwrap_or(&default_expires);
+        self.check_push_replay_window(expires)?;
 
         Ok(PaymentChallenge::with_challenge_binding_secret_full(
             &self.challenge_binding_secret,
@@ -688,17 +920,49 @@ impl Mpp {
         ))
     }
 
+    /// With push mode on, any challenge may be paid by presenting an
+    /// already-landed signature, which stays fetchable long after its
+    /// blockhash expired. Its replay protection is the store's memory of that
+    /// signature, so a challenge must not outlive it.
+    fn check_push_replay_window(&self, expires: &str) -> Result<(), Error> {
+        if !self.accept_push_mode {
+            return Ok(());
+        }
+        within_replay_retention(Some(expires)).map_err(|e| Error::InvalidConfig(e.message))
+    }
+
     /// Audit #19: ensure a caller-built `ChargeRequest` parses and binds
     /// to this server's route before we HMAC-sign it. Fields covered:
     /// `amount`, `currency`, `recipient`, and the `methodDetails`
     /// fragments that pin the server-side configuration
     /// (`network`, `decimals`, `tokenProgram`, splits).
+    /// A caller-built request may name the currency the way it is configured
+    /// (a symbol such as `USDC`, or `SOL`). Resolve it to the wire form this
+    /// server issues, so nothing but `"sol"` or a mint reaches the wire and
+    /// caller requests compare equal to issued ones.
+    fn with_wire_currency<'r>(
+        &self,
+        request: &'r ChargeRequest,
+    ) -> std::borrow::Cow<'r, ChargeRequest> {
+        match wire_currency(&request.currency, &self.network) {
+            Ok(currency) if currency != request.currency => {
+                let mut resolved = request.clone();
+                resolved.currency = currency;
+                std::borrow::Cow::Owned(resolved)
+            }
+            _ => std::borrow::Cow::Borrowed(request),
+        }
+    }
+
     fn validate_charge_request(&self, request: &ChargeRequest) -> Result<(), Error> {
         request.parse_amount()?;
 
-        if !request.currency.eq_ignore_ascii_case(&self.currency) {
+        // Exact match: the request goes on the wire as is, so it must carry
+        // the resolved wire currency (`"sol"` or the mint), never a symbol.
+        if request.currency != self.currency {
             return Err(Error::InvalidConfig(format!(
-                "ChargeRequest.currency `{}` does not match server-configured currency `{}`",
+                "ChargeRequest.currency `{}` does not match server wire currency `{}` \
+                 (use \"sol\" or the mint address)",
                 request.currency, self.currency
             )));
         }
@@ -713,6 +977,7 @@ impl Mpp {
         if let Some(md_value) = &request.method_details {
             let md: MethodDetails = serde_json::from_value(md_value.clone())
                 .map_err(|e| Error::InvalidConfig(format!("Invalid methodDetails: {e}")))?;
+            self.validate_channel_policy(request, &md)?;
 
             if let Some(network) = md.network.as_deref() {
                 if network != self.network {
@@ -745,9 +1010,35 @@ impl Mpp {
             if let Some(splits) = md.splits.as_deref() {
                 crate::mpp::protocol::solana::validate_splits(splits)?;
             }
+
+            crate::mpp::protocol::solana::validate_confidential_charge(&request.currency, &md)?;
+            if md.confidential == Some(true) {
+                self.confidential_sponsor(&md)
+                    .map_err(Error::InvalidConfig)?;
+            }
         }
 
         Ok(())
+    }
+
+    /// The gateway key that sponsors a confidential charge: the configured
+    /// fee-payer signer, which `md` must name as its sponsor. Checked when the
+    /// challenge is issued and again before any bundle is co-signed.
+    pub(crate) fn confidential_sponsor(&self, md: &MethodDetails) -> Result<Pubkey, String> {
+        let signer = self.fee_payer_signer.as_ref().ok_or_else(|| {
+            "confidential charges require a fee_payer_signer (the gateway pays bundle fees)"
+                .to_string()
+        })?;
+        let sponsor = signer.pubkey();
+        if md.fee_payer != Some(true)
+            || md.fee_payer_key.as_deref() != Some(sponsor.to_string().as_str())
+        {
+            return Err(format!(
+                "confidential charges must be sponsored by this gateway: feePayer=true and \
+                 feePayerKey={sponsor}"
+            ));
+        }
+        Ok(sponsor)
     }
 
     // ── Verification ──
@@ -779,6 +1070,18 @@ impl Mpp {
         // request. Do not inspect an unauthenticated request here: a foreign
         // challenge must fail authentication, not route-specific validation.
         self.verify(credential, expected).await
+    }
+
+    /// [`verify_credential_with_expected`](Self::verify_credential_with_expected)
+    /// for a challenge issued with [`ChargeOptions::route`]: the credential's
+    /// authenticated route must equal `route`.
+    pub async fn verify_credential_for_route(
+        &self,
+        credential: &PaymentCredential,
+        expected: &ChargeRequest,
+        route: &str,
+    ) -> Result<Receipt, VerificationError> {
+        self.verify_bound(credential, expected, Some(route)).await
     }
 
     /// Tier-2 pinned-field check.
@@ -831,15 +1134,47 @@ impl Mpp {
             ));
         }
 
+        // Settlement derives the mint and accounts from this network, so a
+        // challenge for another network must not settle here. An omitted
+        // network is the protocol default.
+        let network = request
+            .method_details
+            .as_ref()
+            .and_then(|md| md.get("network"))
+            .map(|network| network.as_str().ok_or(()))
+            .transpose()
+            .map_err(|()| {
+                VerificationError::invalid_payload("methodDetails.network must be a string")
+            })?
+            .unwrap_or("mainnet");
+        if network != self.network {
+            return Err(VerificationError::credential_mismatch(format!(
+                "Credential network '{network}' does not match this server (expected '{}')",
+                self.network
+            )));
+        }
+
         Ok(())
     }
 
-    /// Verify a charge credential with an explicit request.
+    /// Verify a charge credential with an explicit request. Route-bound
+    /// credentials are rejected; use
+    /// [`verify_credential_for_route`](Self::verify_credential_for_route).
     pub async fn verify(
         &self,
         credential: &PaymentCredential,
         request: &ChargeRequest,
     ) -> Result<Receipt, VerificationError> {
+        self.verify_bound(credential, request, None).await
+    }
+
+    async fn verify_bound(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+        route: Option<&str>,
+    ) -> Result<Receipt, VerificationError> {
+        let request = &*self.with_wire_currency(request);
         // Tier 1: Verify HMAC.
         let expected_id = compute_challenge_id(
             &self.challenge_binding_secret,
@@ -863,16 +1198,42 @@ impl Mpp {
                 "Challenge ID mismatch — not issued by this server",
             ));
         }
+        // `opaque` is HMAC-covered, so the route it names is authentic.
+        if challenge_route(&credential.challenge).as_deref() != route {
+            return Err(VerificationError::credential_mismatch(
+                "Credential was issued for a different route",
+            ));
+        }
 
-        // Check expiry.
+        // A channel submission can reconcile an already-landed transaction
+        // after HTTP expiry, but cannot authorize another execution.
+        let mut expired_channel_challenge = false;
+        let mut expired_pending = None;
         if let Some(ref expires) = credential.challenge.expires {
             if let Ok(expires_at) =
                 time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
             {
                 if expires_at <= time::OffsetDateTime::now_utc() {
-                    return Err(VerificationError::expired(format!(
-                        "Challenge expired at {expires}"
-                    )));
+                    let issued: ChargeRequest = credential
+                        .challenge
+                        .request
+                        .decode()
+                        .map_err(|e| VerificationError::invalid_payload(e.to_string()))?;
+                    expired_channel_challenge = issued
+                        .method_details
+                        .as_ref()
+                        .and_then(|md| md.get("channelCharge"))
+                        .is_some_and(|profile| !profile.is_null());
+                    if !expired_channel_challenge {
+                        // Only a broadcast already pending for this exact
+                        // credential may still be reconciled; nothing new settles.
+                        expired_pending = self.expired_pending_charge(credential).await?;
+                        if expired_pending.is_none() {
+                            return Err(VerificationError::expired(format!(
+                                "Challenge expired at {expires}"
+                            )));
+                        }
+                    }
                 }
             } else {
                 return Err(VerificationError::new(
@@ -949,7 +1310,46 @@ impl Mpp {
         let digest =
             normalized_request_digest(&challenge_id, credential.challenge.request.raw(), &payload)?;
         let charge_store = self.charge_replay_store();
-        match charge_store
+        if method_details.channel_charge.is_some() {
+            self.validate_channel_policy(request, &method_details)
+                .map_err(|e| VerificationError::invalid_payload(e.to_string()))?;
+            if let CredentialPayload::Transaction { transaction } = &payload {
+                if let Some(signature) = self
+                    .reconcile_channel_submission(&credential.challenge, transaction)
+                    .await?
+                {
+                    if let Err(error) = charge_store
+                        .record_confirmed(&challenge_id, &signature)
+                        .await
+                    {
+                        // The immutable receipt claim already consumed this
+                        // payment; secondary bookkeeping must not lose its receipt.
+                        tracing::warn!(
+                            %error,
+                            %challenge_id,
+                            "failed to persist reconciled charge record"
+                        );
+                    }
+                    return Ok(Receipt::success(METHOD_NAME, &signature, challenge_id));
+                }
+            }
+        }
+        if expired_channel_challenge {
+            return Err(VerificationError::expired(
+                "Expired channel challenge has no submitted payment to reconcile",
+            ));
+        }
+        if let Some((generation, final_signature)) = expired_pending {
+            return self
+                .reconcile_pending_charge(
+                    &charge_store,
+                    &challenge_id,
+                    generation,
+                    &final_signature,
+                )
+                .await;
+        }
+        let generation = match charge_store
             .reserve(&challenge_id, &digest, CHARGE_RESERVATION_LEASE)
             .await
             .map_err(|e| VerificationError::new(format!("Store error: {e}")))?
@@ -979,8 +1379,27 @@ impl Mpp {
                     "This challenge was already presented with a different request or credential",
                 ));
             }
-            ChargeReservation::Reserved => {}
-        }
+            ChargeReservation::PendingConfirmation {
+                generation,
+                final_signature,
+            } => {
+                return self
+                    .reconcile_pending_charge(
+                        &charge_store,
+                        &challenge_id,
+                        generation,
+                        &final_signature,
+                    )
+                    .await;
+            }
+            ChargeReservation::Reserved { generation } => generation,
+        };
+        let mut fence = BroadcastFence {
+            store: charge_store.clone(),
+            challenge_id: challenge_id.clone(),
+            generation,
+            pending: None,
+        };
 
         // Settle, with the consume_signature reservation sitting between
         // broadcast and confirmation polling. If the server crashes or the
@@ -989,33 +1408,186 @@ impl Mpp {
         // cannot trigger a second broadcast. See PR #85 Greptile P1 and
         // audit gap G05.
         match self
-            .settle_payload(&payload, request, &method_details)
+            .settle_payload(
+                &payload,
+                request,
+                &method_details,
+                &credential.challenge,
+                &mut fence,
+            )
             .await
         {
             Ok(signature_str) => {
-                if let Err(e) = charge_store
-                    .mark_confirmed(&challenge_id, &signature_str)
+                if method_details.channel_charge.is_some() {
+                    self.claim_channel_receipt(&challenge_id, &signature_str)
+                        .await?;
+                }
+                match charge_store
+                    .mark_confirmed(&challenge_id, fence.generation, &signature_str)
                     .await
                 {
-                    tracing::warn!(
+                    Ok(true) => {}
+                    // A retry reconciled this pending broadcast first and was
+                    // granted its receipt: one receipt per payment.
+                    Ok(false) if method_details.channel_charge.is_none() => {
+                        return Err(VerificationError::signature_consumed(format!(
+                            "Transaction signature already consumed — challenge {challenge_id} \
+                             was already settled (tx {signature_str})"
+                        )));
+                    }
+                    Ok(false) => {}
+                    // A pull broadcast recorded as pending: issuing the
+                    // receipt here would let a retry's confirm_pending grant a
+                    // second one once the store recovers, so that retry is the
+                    // one receipt. A push charge records no pending broadcast,
+                    // so no retry can reach confirm_pending: it keeps its
+                    // receipt (below).
+                    Err(e)
+                        if method_details.channel_charge.is_none() && fence.pending.is_some() =>
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            challenge_id = %challenge_id,
+                            "failed to persist confirmed charge record"
+                        );
+                        return Err(VerificationError::settlement_in_progress(format!(
+                            "Transaction {signature_str} confirmed but its record could not be \
+                             stored; retry with the same credential, do not pay again: {e}"
+                        )));
+                    }
+                    Err(e) => tracing::warn!(
                         error = %e,
                         challenge_id = %challenge_id,
                         "failed to persist confirmed charge record"
-                    );
+                    ),
                 }
                 Ok(Receipt::success(METHOD_NAME, &signature_str, challenge_id))
             }
-            Err(err) => {
-                if let Err(e) = charge_store.mark_failed(&challenge_id, &err.message).await {
-                    tracing::warn!(
-                        error = %e,
-                        challenge_id = %challenge_id,
-                        "failed to persist failed charge record"
-                    );
+            Err(SettleFailure::Unconfirmed { signature, error }) => {
+                // The transaction may still land. Its signature was recorded as
+                // pending before it was sent, so a retry reconciles it instead
+                // of the payer paying again.
+                debug_assert_eq!(fence.pending.as_deref(), Some(signature.as_str()));
+                Err(VerificationError::settlement_in_progress(format!(
+                    "Transaction {signature} was broadcast but not yet confirmed; retry with the \
+                     same credential to reconcile, do not pay again: {}",
+                    error.message
+                )))
+            }
+            Err(SettleFailure::Failed(err)) => {
+                if method_details.channel_charge.is_none() {
+                    match charge_store
+                        .mark_failed(&challenge_id, fence.generation, &err.message)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!(
+                            challenge_id = %challenge_id,
+                            "charge reservation was superseded; failure not recorded"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            challenge_id = %challenge_id,
+                            "failed to persist failed charge record"
+                        ),
+                    }
                 }
                 Err(err)
             }
         }
+    }
+
+    /// The pending broadcast recorded for this exact credential, if any.
+    async fn expired_pending_charge(
+        &self,
+        credential: &PaymentCredential,
+    ) -> Result<Option<(u64, String)>, VerificationError> {
+        let Ok(payload) = serde_json::from_value::<CredentialPayload>(credential.payload.clone())
+        else {
+            return Ok(None);
+        };
+        let digest = normalized_request_digest(
+            &credential.challenge.id,
+            credential.challenge.request.raw(),
+            &payload,
+        )?;
+        self.charge_replay_store()
+            .pending(&credential.challenge.id, &digest)
+            .await
+            .map_err(|e| VerificationError::new(format!("Store error: {e}")))
+    }
+
+    /// Resolve a charge whose broadcast outcome was unknown. The record is
+    /// owned by this caller (same challenge and digest); it is never
+    /// re-broadcast, only settled from the signature's on-chain status.
+    async fn reconcile_pending_charge(
+        &self,
+        charge_store: &ChargeReplayStore,
+        challenge_id: &str,
+        generation: u64,
+        final_signature: &str,
+    ) -> Result<Receipt, VerificationError> {
+        use solana_commitment_config::CommitmentConfig;
+        let signature = Signature::from_str(final_signature).map_err(|e| {
+            VerificationError::new(format!("Invalid pending settlement signature: {e}"))
+        })?;
+        let unresolved = |detail: String| {
+            VerificationError::settlement_in_progress(format!(
+                "Transaction {final_signature} is not yet confirmed; retry shortly, do not pay \
+                 again{detail}"
+            ))
+        };
+        // Only an explicit on-chain outcome resolves the record. A missing
+        // status is never proof of non-execution, even once the blockhash has
+        // expired: the queried node may lag or lack history for a transaction
+        // that committed in time, and failing here would release the client to
+        // pay a replacement.
+        let status = self
+            .rpc
+            .get_signature_status_with_commitment_and_history(
+                &signature,
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .map_err(|e| unresolved(format!(": {e}")))?;
+        let failure = match status {
+            Some(Ok(())) => {
+                // One receipt per payment: only the caller that wins the
+                // pending -> confirmed transition is granted access.
+                let claimed = charge_store
+                    .confirm_pending(challenge_id, generation, final_signature)
+                    .await
+                    .map_err(|e| unresolved(format!(": {e}")))?;
+                if !claimed {
+                    return Err(VerificationError::signature_consumed(format!(
+                        "Transaction signature already consumed — challenge {challenge_id} was \
+                         already settled (tx {final_signature})"
+                    )));
+                }
+                return Ok(Receipt::success(
+                    METHOD_NAME,
+                    final_signature,
+                    challenge_id.to_string(),
+                ));
+            }
+            Some(Err(error)) => VerificationError::transaction_failed(format!(
+                "Transaction landed on-chain but failed: {error}"
+            )),
+            None => return Err(unresolved(String::new())),
+        };
+        match charge_store
+            .mark_failed(challenge_id, generation, &failure.message)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(%challenge_id, "pending charge was superseded; failure not recorded")
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, %challenge_id, "failed to persist failed charge record")
+            }
+        }
+        Err(failure)
     }
 
     /// Settle a decoded credential payload against `request`/`method_details`
@@ -1029,14 +1601,40 @@ impl Mpp {
         payload: &CredentialPayload,
         request: &ChargeRequest,
         method_details: &MethodDetails,
-    ) -> Result<String, VerificationError> {
+        challenge: &crate::mpp::protocol::core::ChallengeEcho,
+        fence: &mut BroadcastFence,
+    ) -> Result<String, SettleFailure> {
+        if method_details.channel_charge.is_some() {
+            self.validate_channel_policy(request, method_details)
+                .map_err(|e| VerificationError::invalid_payload(e.to_string()))?;
+            if !matches!(payload, CredentialPayload::Transaction { .. }) {
+                return Err(VerificationError::invalid_payload(
+                    "channel charges require a decoded transaction credential",
+                )
+                .into());
+            }
+        }
         match payload {
             CredentialPayload::Transaction { transaction } => {
+                // Claims the signature before sending, so nothing that can
+                // fail after the broadcast is left to record the payment.
                 let signature = self
-                    .broadcast_pull(transaction, request, method_details)
+                    .broadcast_pull(transaction, request, method_details, challenge, fence)
                     .await?;
-                self.consume_signature(&signature).await?;
-                self.await_pull_confirmation(&signature)?;
+                if method_details.channel_charge.is_some() {
+                    self.await_pull_confirmation(&signature)
+                        .and_then(|()| self.verify_confirmed_channel_charge(&signature, transaction, challenge))
+                        .map_err(|error| VerificationError::settlement_in_progress(format!(
+                            "Channel transaction {signature} requires outcome reconciliation; do not pay again: {error}",
+                        )))?;
+                } else if let Err(error) = self.await_pull_confirmation(&signature) {
+                    // Timeouts and RPC errors are retryable: the transaction
+                    // may still land. A landed-and-failed status is not.
+                    if !error.retryable {
+                        return Err(error.into());
+                    }
+                    return Err(SettleFailure::Unconfirmed { signature, error });
+                }
                 Ok(signature)
             }
             CredentialPayload::Signature { signature } => {
@@ -1048,7 +1646,7 @@ impl Mpp {
                 if !self.accept_push_mode {
                     return Err(VerificationError::credential_mismatch(
                         "Push-mode credentials are disabled on this server (Config.accept_push_mode is false; spec §13.5)",
-                    ));
+                    ).into());
                 }
                 // B34: reject push-mode credentials (`type=signature`) on
                 // routes that require a server-side fee payer. A signature-
@@ -1061,8 +1659,12 @@ impl Mpp {
                 if method_details.fee_payer.unwrap_or(false) {
                     return Err(VerificationError::credential_mismatch(
                         "Push-mode credentials are not allowed when the route uses a server-side fee payer",
-                    ));
+                    ).into());
                 }
+                // The consumed-signature record is all that stops this
+                // signature from paying again, so the challenge must expire
+                // while the store still remembers it.
+                within_replay_retention(challenge.expires.as_deref())?;
                 let signature_str = self.verify_push(signature, request, method_details)?;
                 self.consume_signature(&signature_str).await?;
                 Ok(signature_str)
@@ -1075,7 +1677,7 @@ impl Mpp {
                 // and the recipient-recovered amount matches the charge.
                 // TODO: pending-delivery semantics — a future Receipt revision
                 // could mark delivery as "pending" for asynchronous flows.
-                self.settle_confidential_bundle(transactions, request, method_details)
+                self.settle_confidential_bundle_inner(transactions, request, method_details, fence)
                     .await
             }
             #[cfg(not(feature = "confidential"))]
@@ -1085,7 +1687,8 @@ impl Mpp {
                 // closed when it is not compiled in.
                 Err(VerificationError::credential_mismatch(
                     "Confidential-transfer bundle credentials are not supported by this server (built without the `confidential` feature)",
-                ))
+                )
+                .into())
             }
         }
     }
@@ -1106,10 +1709,8 @@ impl Mpp {
         &self,
         signature_str: &str,
     ) -> Result<(), VerificationError> {
-        let consumed_key = format!("solana-charge:consumed:{signature_str}");
-        let inserted = self
-            .store
-            .put_if_absent(&consumed_key, serde_json::json!(true))
+        let inserted = crate::core::store::ConsumedSignatures::new(self.store.clone())
+            .claim(signature_str)
             .await
             .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
         if !inserted {
@@ -1118,6 +1719,22 @@ impl Mpp {
             ));
         }
         Ok(())
+    }
+
+    /// Release a claim on a transaction that provably never landed.
+    pub(crate) async fn release_signature(&self, signature: &str) {
+        match crate::core::store::ConsumedSignatures::new(self.store.clone())
+            .release(signature)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(%signature, "unsent charge signature changed hands; not released")
+            }
+            Err(error) => {
+                tracing::warn!(%error, %signature, "failed to release unsent charge signature")
+            }
+        }
     }
 
     /// Pull mode: deserialize tx, optionally co-sign, simulate, broadcast.
@@ -1168,7 +1785,9 @@ impl Mpp {
         transaction_b64: &str,
         request: &ChargeRequest,
         method_details: &MethodDetails,
-    ) -> Result<String, VerificationError> {
+        challenge: &crate::mpp::protocol::core::ChallengeEcho,
+        fence: &mut BroadcastFence,
+    ) -> Result<String, SettleFailure> {
         let tx_bytes =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, transaction_b64)
                 .map_err(|e| {
@@ -1186,27 +1805,99 @@ impl Mpp {
         // (e.g. mainnet keypair pointed at a sandbox-configured server, or
         // vice versa). Cheaper and clearer than letting the broadcast fail.
         let tx_recent_blockhash = tx.message.recent_blockhash().to_string();
-        let uses_challenge_blockhash = method_details
-            .recent_blockhash
-            .as_deref()
-            .map(|recent_blockhash| recent_blockhash == tx_recent_blockhash)
-            .unwrap_or(false);
+        // Bind the signed message to the authenticated challenge it is
+        // presented with: a transaction signed for another challenge carries
+        // that challenge's blockhash. `method_details` is the caller's rebuilt
+        // expectation, whose blockhash is fresh, so read the echoed challenge.
+        let challenged_blockhash = challenge
+            .request
+            .decode::<ChargeRequest>()
+            .ok()
+            .and_then(|issued| issued.method_details)
+            .and_then(|md| serde_json::from_value::<MethodDetails>(md).ok())
+            .and_then(|md| md.recent_blockhash);
+        if method_details.channel_charge.is_none() {
+            if let Some(challenged) = challenged_blockhash.as_deref() {
+                if challenged != tx_recent_blockhash {
+                    return Err(VerificationError::credential_mismatch(
+                        "Transaction does not use the challenged blockhash",
+                    )
+                    .into());
+                }
+            }
+        }
+        let uses_challenge_blockhash =
+            challenged_blockhash.as_deref() == Some(&tx_recent_blockhash);
         check_network_blockhash(&self.network, &tx_recent_blockhash)?;
 
         // Verify the transaction instructions BEFORE co-signing or broadcasting.
-        verify_versioned_transaction_pre_broadcast(
-            &tx,
-            request,
-            method_details,
-            &self.accepted_versions,
-        )?;
+        if method_details.channel_charge.is_some() {
+            let config = self.channel_charge.as_ref().ok_or_else(|| {
+                VerificationError::invalid_payload("channel charges are disabled")
+            })?;
+            crate::mpp::protocol::channel_charge::verify_transaction(&tx, challenge, &config.hooks)
+                .map_err(|e| VerificationError::invalid_payload(e.to_string()))?;
+            let version = crate::core::tx::TxVersion::of(&tx.message)
+                .map_err(|e| VerificationError::invalid_payload(e.to_string()))?;
+            if !self.accepted_versions.contains(&version) {
+                return Err(VerificationError::invalid_payload(
+                    "channel transaction version disabled",
+                )
+                .into());
+            }
+            self.simulate_channel_charge(&tx, challenge)?;
+            crate::core::signing::sign_versioned_transaction_slot(
+                config.payee_signer.as_ref(),
+                &mut tx,
+            )
+            .await
+            .map_err(|e| VerificationError::invalid_payload(e.to_string()))?;
+        } else {
+            verify_client_pull_transaction(&tx, request, method_details, &self.accepted_versions)?;
+        }
         tracing::info!(elapsed_ms = %t0.elapsed().as_millis(), step = "pre_broadcast_check", "verify_pull");
 
-        // Co-sign if server is fee payer (only after verification passes).
-        if method_details.fee_payer.unwrap_or(false) {
+        // Channel payee is the configured sponsor in sponsored mode and its
+        // slot was already signed above. Do not prompt that wallet twice.
+        if method_details.fee_payer.unwrap_or(false) && method_details.channel_charge.is_none() {
             self.cosign_fee_payer_slot(&mut tx).await?;
         }
+        if method_details.channel_charge.is_some() {
+            let config = self.channel_charge.as_ref().ok_or_else(|| {
+                VerificationError::invalid_payload("channel charges are disabled")
+            })?;
+            // A signing backend must not change the approved message or leave
+            // required signatures missing. Recheck before recording/submission.
+            crate::mpp::protocol::channel_charge::verify_transaction(&tx, challenge, &config.hooks)
+                .map_err(|e| VerificationError::invalid_payload(e.to_string()))?;
+            tx.verify_and_hash_message()
+                .map_err(|e| VerificationError::invalid_payload(e.to_string()))?;
+            self.record_channel_submission(challenge, transaction_b64, &tx)
+                .await?;
+        }
         tracing::info!(elapsed_ms = %t0.elapsed().as_millis(), step = "cosign", "verify_pull");
+
+        // Every signature must verify against the exact message before its
+        // signature is claimed or the transaction is sent. A forged signature
+        // would otherwise name the charge: the node refuses it without a
+        // preflight result (sigverify), the charge is kept as possibly sent,
+        // and a retry would reconcile on the status of whatever landed
+        // transaction owns that signature. A refusal here sends nothing.
+        if method_details.channel_charge.is_none() {
+            tx.verify_and_hash_message().map_err(|e| {
+                VerificationError::invalid_payload(format!(
+                    "Transaction signature verification failed: {e}"
+                ))
+            })?;
+        }
+
+        // Every signature is in place, so the transaction's identity is known
+        // before it leaves this process. Record and claim it now: a store
+        // failure here provably sent nothing, while one after the broadcast
+        // would leave a possibly-landed payment unrecorded and the charge free
+        // to be paid again.
+        let local_signature = final_signature(&tx)?;
+        fence.begin(self, &local_signature).await?;
 
         // Broadcast with the node's preflight simulation (skip_preflight stays
         // off) rather than a separate simulate round-trip: on success the tx is
@@ -1220,8 +1911,22 @@ impl Mpp {
         // Confirmation polling stays in await_pull_confirmation so the caller
         // can reserve the signature in the replay store between broadcast
         // acceptance and confirmation polling.
+        //
+        // Only a preflight rejection proves the node did not forward the
+        // transaction. Any other send error (a lost response, a 5xx from a
+        // proxy that already forwarded it) leaves the outcome unknown, and so
+        // does everything after an attempt that might have been forwarded: the
+        // claimed signature is then kept and reconciled, never released.
+        let mut maybe_sent = false;
+        let ambiguous = |error: VerificationError| SettleFailure::Unconfirmed {
+            signature: local_signature.clone(),
+            error,
+        };
         let mut broadcast_signature: Option<Signature> = None;
         for attempt in 1..=SIMULATION_MAX_ATTEMPTS {
+            if method_details.channel_charge.is_some() {
+                super::channel_charge::ensure_send_allowed(challenge, &tx)?;
+            }
             let retrying = attempt < SIMULATION_MAX_ATTEMPTS;
             match crate::core::rpc::send_transaction(
                 &self.rpc,
@@ -1259,6 +1964,7 @@ impl Mpp {
                             .map(|e| e.to_string())
                             .unwrap_or_else(|| "unknown error".to_string());
                         if !retrying
+                            && method_details.channel_charge.is_none()
                             && uses_challenge_blockhash
                             && is_blockhash_not_found_simulation(sim)
                         {
@@ -1292,7 +1998,9 @@ impl Mpp {
                                         skip_preflight = SKIP_PREFLIGHT_SEND.skip_preflight,
                                         "broadcast_pull skip_preflight rpc error"
                                     );
-                                    return Err(VerificationError::network_error(message));
+                                    return Err(ambiguous(VerificationError::network_error(
+                                        message,
+                                    )));
                                 }
                             }
                         }
@@ -1322,10 +2030,20 @@ impl Mpp {
                             ));
                             continue;
                         }
-                        return Err(VerificationError::transaction_failed(message));
+                        let error = VerificationError::transaction_failed(message);
+                        if maybe_sent {
+                            return Err(ambiguous(error));
+                        }
+                        // Preflight rejected every attempt: the transaction
+                        // was never forwarded, so the payer may present it
+                        // again.
+                        fence.abandon(self).await;
+                        return Err(error.into());
                     }
 
-                    // Transport / RPC error (node unreachable, transient 5xx).
+                    // Transport / RPC error (node unreachable, transient 5xx,
+                    // lost response): the node may have accepted it.
+                    maybe_sent = true;
                     let message = format!("Broadcast RPC error: {err}");
                     tracing::warn!(
                         elapsed_ms = %t0.elapsed().as_millis(),
@@ -1341,12 +2059,14 @@ impl Mpp {
                         ));
                         continue;
                     }
-                    return Err(VerificationError::network_error(message));
+                    return Err(ambiguous(VerificationError::network_error(message)));
                 }
             }
         }
         let signature = broadcast_signature.ok_or_else(|| {
-            VerificationError::network_error("Broadcast did not complete".to_string())
+            ambiguous(VerificationError::network_error(
+                "Broadcast did not complete".to_string(),
+            ))
         })?;
         tracing::info!(elapsed_ms = %t0.elapsed().as_millis(), step = "send", "broadcast_pull");
         Ok(signature.to_string())
@@ -1355,7 +2075,10 @@ impl Mpp {
     /// Poll for `Confirmed` commitment on a signature that broadcast_pull
     /// already accepted. Surfpool typically confirms within a single tick;
     /// a real RPC may need up to ~32 slots (~12 seconds).
-    fn await_pull_confirmation(&self, signature_str: &str) -> Result<(), VerificationError> {
+    pub(crate) fn await_pull_confirmation(
+        &self,
+        signature_str: &str,
+    ) -> Result<(), VerificationError> {
         use solana_commitment_config::CommitmentConfig;
         use std::str::FromStr;
         let signature = Signature::from_str(signature_str).map_err(|e| {
@@ -1638,6 +2361,27 @@ pub fn check_network_blockhash(
     )))
 }
 
+/// Conformance hooks (feature `testkit`). Not a payment verifier: nothing
+/// here checks the challenge binding, consumes replay state, co-signs or
+/// broadcasts. Use [`Mpp::verify`] to accept payments.
+#[cfg(feature = "testkit")]
+pub mod testkit {
+    use super::*;
+
+    /// Run the offline pre-broadcast checks [`Mpp`] applies to a pull-mode
+    /// charge transaction before it co-signs and broadcasts: envelope and
+    /// compute caps, fee-payer isolation, the exact transfer set for
+    /// `request` and `method_details`, and the client's signatures.
+    pub fn verify_transaction_pre_broadcast(
+        tx: &VersionedTransaction,
+        request: &ChargeRequest,
+        method_details: &MethodDetails,
+        accepted_versions: &[TxVersion],
+    ) -> Result<(), VerificationError> {
+        verify_client_pull_transaction(tx, request, method_details, accepted_versions)
+    }
+}
+
 // ── Pre-broadcast verification ──
 //
 // Inspects the raw Transaction instructions to verify amounts and recipients
@@ -1657,6 +2401,27 @@ fn verify_transaction_pre_broadcast(
     )
 }
 
+/// The pull-mode checks a client transaction passes before the server
+/// co-signs it: [`verify_versioned_transaction_pre_broadcast`], then the
+/// client's signatures. One that does not verify over this message names
+/// another transaction, which a pending retry would reconcile by that
+/// transaction's status (RULINGS SIG1); the fee payer slot stays empty for
+/// the server.
+fn verify_client_pull_transaction(
+    tx: &VersionedTransaction,
+    request: &ChargeRequest,
+    method_details: &MethodDetails,
+    accepted_versions: &[TxVersion],
+) -> Result<(), VerificationError> {
+    verify_versioned_transaction_pre_broadcast(tx, request, method_details, accepted_versions)?;
+    let fee_payer = expected_fee_payer(tx, method_details)?;
+    crate::core::tx::require_presigned(tx, fee_payer.as_ref()).map_err(|e| {
+        VerificationError::invalid_payload(format!(
+            "Transaction signature verification failed: {e}"
+        ))
+    })
+}
+
 fn verify_versioned_transaction_pre_broadcast(
     tx: &VersionedTransaction,
     request: &ChargeRequest,
@@ -1669,16 +2434,13 @@ fn verify_versioned_transaction_pre_broadcast(
     crate::core::tx::check_envelope(tx, accepted_versions)
         .map_err(|e| VerificationError::invalid_payload(e.to_string()))?;
     let fee_sponsored = method_details.fee_payer.unwrap_or(false);
-    crate::core::tx::check_v1_budget_caps(
-        &tx.message,
-        MAX_COMPUTE_UNIT_LIMIT,
-        if fee_sponsored {
-            MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS_FEE_SPONSORED
-        } else {
-            MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS
-        },
-    )
-    .map_err(|e| VerificationError::invalid_payload(e.to_string()))?;
+    let max_price = if fee_sponsored {
+        MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS_FEE_SPONSORED
+    } else {
+        MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS
+    };
+    crate::core::tx::check_v1_budget_caps(&tx.message, MAX_COMPUTE_UNIT_LIMIT, max_price)
+        .map_err(|e| VerificationError::invalid_payload(e.to_string()))?;
 
     let splits = method_details.splits.as_deref().unwrap_or(&[]);
     if splits.len() > crate::mpp::protocol::solana::MAX_SPLITS {
@@ -1770,6 +2532,7 @@ fn verify_versioned_transaction_pre_broadcast(
             fee_payer.as_ref(),
             &ata_policy.required_owners,
         )?;
+        verify_required_signers(tx, account_keys, &matched_instruction_indexes)?;
     } else {
         let expected_mint =
             resolve_expected_mint(&request.currency, method_details.network.as_deref())?;
@@ -1830,8 +2593,70 @@ fn verify_versioned_transaction_pre_broadcast(
             fee_payer.as_ref(),
             &ata_policy.required_owners,
         )?;
+        verify_required_signers(tx, account_keys, &matched_instruction_indexes)?;
     }
 
+    // Version 0: the budget as a whole (duplicates, and the implicit limit a
+    // price-only budget gets), after the per-instruction checks above.
+    crate::core::tx::check_v0_budget_caps(&tx.message, MAX_COMPUTE_UNIT_LIMIT, max_price)
+        .map_err(|e| VerificationError::invalid_payload(e.to_string()))?;
+    Ok(())
+}
+
+/// Every required signer must be the fee payer or the one authority that
+/// funds every matched payment transfer. Any other signer authorizes nothing
+/// and only adds a signature fee, which a sponsor would pay; letting each leg
+/// of a split name its own authority would let a payer multiply those fees.
+fn verify_required_signers(
+    tx: &VersionedTransaction,
+    account_keys: &[Pubkey],
+    matched_payment_instruction_indexes: &HashSet<usize>,
+) -> Result<(), VerificationError> {
+    let system_program = Pubkey::from_str(programs::SYSTEM_PROGRAM).unwrap();
+    let token_program = Pubkey::from_str(programs::TOKEN_PROGRAM).unwrap();
+    let token_2022_program = Pubkey::from_str(programs::TOKEN_2022_PROGRAM).unwrap();
+    let instructions = tx.message.instructions();
+    let mut funding_authority: Option<&Pubkey> = None;
+    for index in matched_payment_instruction_indexes {
+        let Some(ix) = instructions.get(*index) else {
+            continue;
+        };
+        let program = account_keys.get(ix.program_id_index as usize);
+        let authority_position = if program == Some(&system_program) {
+            0
+        } else if program == Some(&token_program) || program == Some(&token_2022_program) {
+            3
+        } else {
+            continue;
+        };
+        if let Some(authority) = ix
+            .accounts
+            .get(authority_position)
+            .and_then(|i| account_keys.get(*i as usize))
+        {
+            if funding_authority.is_some_and(|funder| funder != authority) {
+                return Err(VerificationError::invalid_payload(
+                    "Payment transfers must share one funding authority",
+                ));
+            }
+            funding_authority = Some(authority);
+        }
+    }
+    let allowed: HashSet<&Pubkey> = account_keys
+        .first()
+        .into_iter()
+        .chain(funding_authority)
+        .collect();
+    let required = usize::from(tx.message.header().num_required_signatures);
+    if account_keys
+        .iter()
+        .take(required)
+        .any(|signer| !allowed.contains(signer))
+    {
+        return Err(VerificationError::invalid_payload(
+            "Unexpected signer in payment transaction",
+        ));
+    }
     Ok(())
 }
 
@@ -1896,7 +2721,7 @@ fn expected_ata_creation_policy(
 /// any cryptographic purpose: the HMAC challenge id already authenticates
 /// the challenge itself; this digest only distinguishes "identical retry"
 /// from "different request/credential reusing the same challenge id".
-fn normalized_request_digest(
+pub(crate) fn normalized_request_digest(
     challenge_id: &str,
     encoded_request: &str,
     payload: &CredentialPayload,
@@ -1962,6 +2787,23 @@ fn compare_expected_to_request(
     let request_md = parse_method_details_for_compare(&request.method_details, "credential")?;
     let expected_md = parse_method_details_for_compare(&expected.method_details, "expected")?;
 
+    // A freshly rebuilt route expectation has a different slot/hash. Authenticate
+    // the original challenge first, compare only immutable policy here, and use
+    // that original challenge's slot/hash for exact transaction reconstruction.
+    let same_channel_policy = match (&request_md.channel_charge, &expected_md.channel_charge) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.channel_program == b.channel_program
+                && a.channel_version == b.channel_version
+                && a.channel_hooks == b.channel_hooks
+        }
+        _ => false,
+    };
+    if !same_channel_policy {
+        return Err(VerificationError::credential_mismatch(
+            "channel charge profile mismatch",
+        ));
+    }
     if request_md.network != expected_md.network {
         return Err(VerificationError::credential_mismatch(
             "methodDetails.network mismatch",
@@ -1985,6 +2827,22 @@ fn compare_expected_to_request(
     if request_md.fee_payer_key != expected_md.fee_payer_key {
         return Err(VerificationError::credential_mismatch(
             "methodDetails.feePayerKey mismatch",
+        ));
+    }
+    // Settlement mode: the authenticated challenge decides whether only a
+    // confidential Bundle may settle it. A rebuilt expectation must not
+    // downgrade that (or upgrade it), nor swap the keys the confidential
+    // amount is recovered with.
+    if request_md.confidential.unwrap_or(false) != expected_md.confidential.unwrap_or(false) {
+        return Err(VerificationError::credential_mismatch(
+            "methodDetails.confidential mismatch",
+        ));
+    }
+    if request_md.auditor_elgamal_pubkey != expected_md.auditor_elgamal_pubkey
+        || request_md.recipient_elgamal_pubkey != expected_md.recipient_elgamal_pubkey
+    {
+        return Err(VerificationError::credential_mismatch(
+            "methodDetails confidential keys mismatch",
         ));
     }
     // Splits compared element-wise (order-sensitive). A route that pins
@@ -2024,6 +2882,177 @@ fn splits_eq(a: Option<&[Split]>, b: Option<&[Split]>) -> bool {
             && x.label == y.label
             && x.memo == y.memo
     })
+}
+
+/// Challenge `opaque` carrying a server-side route binding.
+fn route_opaque(route: &str) -> Result<Base64UrlJson, Error> {
+    Base64UrlJson::from_value(&serde_json::json!({ "route": route }))
+}
+
+/// The route an authenticated challenge was issued for, if any.
+fn challenge_route(challenge: &crate::mpp::protocol::core::ChallengeEcho) -> Option<String> {
+    challenge
+        .opaque
+        .as_ref()?
+        .decode_value()
+        .ok()?
+        .get("route")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// A challenge that expires within [`DEFAULT_CHARGE_RECORD_RETENTION`] from
+/// now, the time a [`Store`] keeps charge records and consumed signatures. A
+/// challenge without an expiry, or one valid for longer, could be presented
+/// again after the store forgot it was paid.
+fn within_replay_retention(expires: Option<&str>) -> Result<(), VerificationError> {
+    let expires = expires.ok_or_else(|| {
+        VerificationError::credential_mismatch(
+            "Push-mode charges require a challenge expiry within the replay retention window",
+        )
+    })?;
+    let expires_at =
+        time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
+            .map_err(|_| VerificationError::new("Invalid expires timestamp in challenge"))?;
+    let horizon = time::OffsetDateTime::now_utc()
+        + time::Duration::seconds(DEFAULT_CHARGE_RECORD_RETENTION.as_secs() as i64);
+    if expires_at > horizon {
+        return Err(VerificationError::credential_mismatch(format!(
+            "Push-mode challenge expiry {expires} exceeds the {}s replay retention window",
+            DEFAULT_CHARGE_RECORD_RETENTION.as_secs()
+        )));
+    }
+    Ok(())
+}
+
+/// The charge-record generation a settlement owns.
+///
+/// A settlement transaction is only sent after [`Self::begin`] recorded its
+/// signature as pending under this generation, which also fences out a stale
+/// owner: once a lease takeover appended a newer generation, `begin` refuses
+/// and nothing is sent. A record that may have been broadcast is therefore
+/// never lease-reclaimed into a second settlement.
+pub(crate) struct BroadcastFence {
+    store: ChargeReplayStore,
+    challenge_id: String,
+    /// Current generation owned by this settlement.
+    generation: u64,
+    /// The signature recorded as pending, once [`Self::begin`] succeeded.
+    pending: Option<String>,
+}
+
+impl BroadcastFence {
+    /// Claim `signature`, then record it as pending, before it is sent.
+    ///
+    /// The claim comes first: a pending record is what a concurrent retry
+    /// reconciles and grants once the transaction lands, so it must never be
+    /// visible for a signature this charge does not own (one that already
+    /// paid another challenge). If the record cannot be written the claim is
+    /// released, since nothing was sent; on a store error it is kept, because
+    /// the write may have landed.
+    pub(crate) async fn begin(
+        &mut self,
+        mpp: &Mpp,
+        signature: &str,
+    ) -> Result<(), VerificationError> {
+        mpp.consume_signature(signature).await?;
+        match self
+            .store
+            .mark_pending(&self.challenge_id, self.generation, signature)
+            .await
+        {
+            Ok(true) => {
+                self.generation += 1;
+                self.pending = Some(signature.to_string());
+                Ok(())
+            }
+            Ok(false) => {
+                // A newer owner took the reservation over and nothing was
+                // written or sent: the signature is free again.
+                mpp.release_signature(signature).await;
+                Err(VerificationError::settlement_in_progress(
+                    "This charge is being settled by another request; retry shortly",
+                ))
+            }
+            Err(e) => Err(VerificationError::new(format!("Store error: {e}"))),
+        }
+    }
+
+    /// The pending transaction provably never left this process (preflight
+    /// rejected it): release its signature and the reservation.
+    pub(crate) async fn abandon(&mut self, mpp: &Mpp) {
+        let Some(signature) = self.pending.take() else {
+            return;
+        };
+        mpp.release_signature(&signature).await;
+        match self
+            .store
+            .release_pending(&self.challenge_id, self.generation, &signature)
+            .await
+        {
+            Ok(true) => self.generation += 1,
+            Ok(false) => tracing::warn!(
+                challenge_id = %self.challenge_id,
+                "pending charge was superseded; release not recorded"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                challenge_id = %self.challenge_id,
+                "failed to release unsent pending charge"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Mpp {
+    /// A fence over a fresh reservation, for calling settlement directly.
+    pub(crate) async fn test_fence(&self) -> BroadcastFence {
+        let store = self.charge_replay_store();
+        let challenge_id = format!("test-{}", solana_pubkey::Pubkey::new_unique());
+        let ChargeReservation::Reserved { generation } = store
+            .reserve(&challenge_id, "test-digest", CHARGE_RESERVATION_LEASE)
+            .await
+            .unwrap()
+        else {
+            panic!("fresh challenge id must reserve");
+        };
+        BroadcastFence {
+            store,
+            challenge_id,
+            generation,
+            pending: None,
+        }
+    }
+}
+
+/// The signature that identifies `tx` on-chain: its first (fee payer) slot,
+/// which must already be signed.
+pub(crate) fn final_signature(tx: &VersionedTransaction) -> Result<String, VerificationError> {
+    tx.signatures
+        .first()
+        .filter(|signature| **signature != Signature::default())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            VerificationError::invalid_payload("Transaction is missing its fee-payer signature")
+        })
+}
+
+/// Why settlement produced no receipt.
+pub(crate) enum SettleFailure {
+    /// Terminal: nothing was broadcast, or it landed and failed.
+    Failed(VerificationError),
+    /// Broadcast, but the outcome is unknown; `signature` must be reconciled.
+    Unconfirmed {
+        signature: String,
+        error: VerificationError,
+    },
+}
+
+impl From<VerificationError> for SettleFailure {
+    fn from(error: VerificationError) -> Self {
+        Self::Failed(error)
+    }
 }
 
 /// Audit #3: interpret a post-timeout `get_signature_status` result.
@@ -2209,6 +3238,11 @@ pub(crate) fn validate_compute_budget_instruction(
 
     match decode_compute_budget_op(ix) {
         Some(ComputeBudgetOp::UnitLimit(units)) => {
+            if units == 0 {
+                return Err(VerificationError::invalid_payload(
+                    "Compute unit limit must be positive",
+                ));
+            }
             if units > MAX_COMPUTE_UNIT_LIMIT {
                 return Err(VerificationError::invalid_payload(format!(
                     "Compute unit limit {units} exceeds maximum {MAX_COMPUTE_UNIT_LIMIT}"
@@ -2336,7 +3370,7 @@ fn verify_sol_transfer_instructions(
             continue;
         }
         // System program Transfer instruction: 4 bytes type (2u32 LE) + 8 bytes amount (u64 LE)
-        if ix.data.len() < 12 {
+        if ix.data.len() != 12 {
             continue;
         }
         let ix_type = u32::from_le_bytes(ix.data[0..4].try_into().unwrap());
@@ -2345,7 +3379,8 @@ fn verify_sol_transfer_instructions(
             continue;
         }
         let ix_amount = u64::from_le_bytes(ix.data[4..12].try_into().unwrap());
-        if ix.accounts.len() < 2 {
+        // Exactly [source, destination]: trailing accounts could add signers.
+        if ix.accounts.len() != 2 {
             continue;
         }
         let source = account_keys
@@ -2393,7 +3428,11 @@ fn verify_memo_instructions(
             let program_id = account_keys
                 .get(ix.program_id_index as usize)
                 .ok_or_else(|| VerificationError::invalid_payload("Invalid program_id_index"))?;
-            if program_id == &memo_program && ix.data.as_slice() == expected_data {
+            // Memo accounts are signers; the payment memo takes none.
+            if program_id == &memo_program
+                && ix.accounts.is_empty()
+                && ix.data.as_slice() == expected_data
+            {
                 matched_instruction_indexes.insert(index);
                 found = true;
                 break;
@@ -2442,11 +3481,12 @@ fn verify_spl_transfer_instructions(
         //   data[0] = 12 (instruction type)
         //   data[1..9] = amount (u64 LE)
         //   data[9] = decimals (u8)
-        // Accounts: [source, mint, destination, authority, ...]
+        // Accounts: exactly [source, mint, destination, authority]; trailing
+        // (multisig) accounts could add signers.
         if ix.data.is_empty() || ix.data[0] != 12 {
             continue;
         }
-        if ix.data.len() < 10 || ix.accounts.len() < 4 {
+        if ix.data.len() != 10 || ix.accounts.len() != 4 {
             continue;
         }
         let ix_amount = u64::from_le_bytes(ix.data[1..9].try_into().unwrap());
@@ -3014,6 +4054,13 @@ fn preflight_simulation(err: &ClientError) -> Option<&RpcSimulateTransactionResu
     }
 }
 
+/// Whether a send error is a preflight rejection, the one send failure that
+/// proves the node did not forward the transaction.
+#[cfg(feature = "confidential")]
+pub(crate) fn is_preflight_rejection(err: &ClientError) -> bool {
+    preflight_simulation(err).is_some()
+}
+
 fn is_blockhash_not_found_simulation(sim: &RpcSimulateTransactionResult) -> bool {
     sim.err
         .as_ref()
@@ -3378,15 +4425,16 @@ impl std::error::Error for VerificationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mpp::store::MemoryStore;
 
     // Confidential bundle verification + orphan-guard moved to `server::confidential`;
     // the unit tests below stay here (they reuse this module's `dummy_tx` helper).
     #[cfg(feature = "worker")]
-    use crate::mpp::server::confidential::{confirm_orphan_seen, orphan_seen_key};
+    use crate::mpp::server::confidential::orphan::{self, OrphanKind};
     #[cfg(feature = "confidential")]
     use crate::mpp::server::confidential::{
-        verify_confidential_bundle_tx, MAX_CONFIDENTIAL_COMPUTE_UNIT_LIMIT,
-        ZK_ELGAMAL_PROOF_PROGRAM,
+        verify_confidential_account_lifecycle, verify_confidential_bundle_tx,
+        MAX_CONFIDENTIAL_COMPUTE_UNIT_LIMIT, ZK_ELGAMAL_PROOF_PROGRAM,
     };
 
     // ── check_network_blockhash ────────────────────────────────────────────
@@ -3482,8 +4530,7 @@ mod tests {
         // Tx landed on-chain but the runtime rejected it. This is a real
         // transaction failure, not a timeout — surface the on-chain error.
         let err = interpret_post_timeout_status(Ok(Some(Err("InsufficientFundsForFee".into()))))
-            .err()
-            .expect("on-chain failure should be reported");
+            .expect_err("on-chain failure should be reported");
         let msg = format!("{err}");
         assert!(
             msg.contains("landed on-chain but failed"),
@@ -3499,9 +4546,8 @@ mod tests {
     fn interpret_post_timeout_status_not_found_returns_timeout() {
         // Final check confirms the tx is genuinely not on-chain — keep the
         // timeout error.
-        let err = interpret_post_timeout_status(Ok(None))
-            .err()
-            .expect("not-found should still error");
+        let err =
+            interpret_post_timeout_status(Ok(None)).expect_err("not-found should still error");
         let msg = format!("{err}");
         assert!(
             msg.contains("not confirmed within timeout"),
@@ -3517,8 +4563,7 @@ mod tests {
         // can't tell whether the tx landed, so we keep the timeout error
         // but include the RPC failure in the message for ops.
         let err = interpret_post_timeout_status(Err("connection refused".into()))
-            .err()
-            .expect("rpc failure should error");
+            .expect_err("rpc failure should error");
         let msg = format!("{err}");
         assert!(
             msg.contains("not confirmed within timeout"),
@@ -3790,19 +4835,81 @@ mod tests {
 
     #[cfg(feature = "worker")]
     #[tokio::test]
-    async fn orphan_guard_defers_first_sighting_then_confirms() {
+    async fn orphan_guard_defers_until_grace_from_first_sighting() {
         let store = MemoryStore::new();
         let acct = Pubkey::new_unique();
-        // First sweep: never seen ⇒ deferred (not closed), and now recorded.
-        assert!(!confirm_orphan_seen(&store, &acct).await.unwrap());
-        // Second sweep: still present ⇒ confirmed orphaned.
-        assert!(confirm_orphan_seen(&store, &acct).await.unwrap());
-        // A different account starts over (independent two-pass state).
+        let kind = OrphanKind::Record;
+        let grace = orphan::GRACE_SECS;
+        let t0 = 1_000_000;
+        // First sighting (any replica) records the time and defers.
+        assert!(orphan::confirm_at(&store, acct, kind, t0)
+            .await
+            .unwrap()
+            .is_none());
+        // A second sighting before the grace period still defers...
+        assert!(orphan::confirm_at(&store, acct, kind, t0 + 1)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(orphan::confirm_at(&store, acct, kind, t0 + grace - 1)
+            .await
+            .unwrap()
+            .is_none());
+        // ...and does not move the first-seen time forward.
+        let confirmed = orphan::confirm_at(&store, acct, kind, t0 + grace)
+            .await
+            .unwrap()
+            .expect("orphan confirmed after grace");
+        let gateway = Pubkey::new_unique();
+        assert_eq!(
+            confirmed.close_instruction(&gateway).accounts[0].pubkey,
+            acct
+        );
+        // A different account starts its own clock.
         let other = Pubkey::new_unique();
-        assert!(!confirm_orphan_seen(&store, &other).await.unwrap());
+        assert!(orphan::confirm_at(&store, other, kind, t0 + grace)
+            .await
+            .unwrap()
+            .is_none());
         // After a successful close we clear the mark; it then starts fresh.
-        store.delete(&orphan_seen_key(&acct)).await.unwrap();
-        assert!(!confirm_orphan_seen(&store, &acct).await.unwrap());
+        store.delete(&orphan::seen_key(&acct)).await.unwrap();
+        assert!(orphan::confirm_at(&store, acct, kind, t0 + 2 * grace)
+            .await
+            .unwrap()
+            .is_none());
+        // The wall-clock entry point defers a fresh account.
+        assert!(orphan::confirm(&store, Pubkey::new_unique(), kind)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(feature = "worker")]
+    #[tokio::test]
+    async fn orphan_guard_restarts_the_clock_on_an_untimed_mark() {
+        let store = MemoryStore::new();
+        let acct = Pubkey::new_unique();
+        let kind = OrphanKind::ProofContext;
+        store
+            .put(&orphan::seen_key(&acct), serde_json::json!(true))
+            .await
+            .unwrap();
+        assert!(orphan::confirm_at(&store, acct, kind, 10)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            orphan::confirm_at(&store, acct, kind, 10 + orphan::GRACE_SECS - 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            orphan::confirm_at(&store, acct, kind, 10 + orphan::GRACE_SECS)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[cfg(feature = "confidential")]
@@ -3815,9 +4922,7 @@ mod tests {
         let zk = Pubkey::from_str(ZK_ELGAMAL_PROOF_PROGRAM).unwrap();
         let record = spl_record::id();
         let create = solana_system_interface::instruction::create_account;
-        let vtx = |ixs: Vec<Instruction>, payer: &Pubkey| {
-            VersionedTransaction::from(dummy_tx(ixs, payer))
-        };
+        let vtx = |ixs: Vec<Instruction>, payer: &Pubkey| dummy_tx(ixs, payer);
         let verify = |tx: &VersionedTransaction| {
             verify_confidential_bundle_tx(
                 tx,
@@ -4095,6 +5200,113 @@ mod tests {
         assert!(verify(&heap).is_err());
     }
 
+    #[cfg(feature = "confidential")]
+    #[test]
+    fn confidential_bundle_requires_complete_funded_account_lifecycles() {
+        use solana_instruction::AccountMeta;
+
+        let gateway = Pubkey::new_unique();
+        let record = Pubkey::new_unique();
+        let record_program = spl_record::id();
+        let token_program = Pubkey::from_str(programs::TOKEN_2022_PROGRAM).unwrap();
+        let recipient_ata = Pubkey::new_unique();
+        let create_record = solana_system_interface::instruction::create_account(
+            &gateway,
+            &record,
+            1_000,
+            100,
+            &record_program,
+        );
+        let initialize_record = Instruction {
+            program_id: record_program,
+            accounts: vec![
+                AccountMeta::new(record, false),
+                AccountMeta::new_readonly(gateway, false),
+            ],
+            data: vec![0],
+        };
+        let close_record = Instruction {
+            program_id: record_program,
+            accounts: vec![
+                AccountMeta::new(record, false),
+                AccountMeta::new_readonly(gateway, true),
+                AccountMeta::new(gateway, false),
+            ],
+            data: vec![3],
+        };
+
+        let confidential_transfer = Instruction {
+            program_id: token_program,
+            accounts: vec![
+                AccountMeta::new(Pubkey::new_unique(), false),
+                AccountMeta::new_readonly(Pubkey::new_unique(), false),
+                AccountMeta::new(recipient_ata, false),
+            ],
+            data: vec![27, 7],
+        };
+
+        // This is the reported exploit shape: every instruction passes the
+        // old per-transaction allow-list, including a valid transfer, but the
+        // gateway-funded record is deliberately left uninitialized.
+        let orphan = dummy_tx(vec![create_record.clone(), confidential_transfer], &gateway);
+        assert_eq!(
+            verify_confidential_bundle_tx(
+                &orphan,
+                &gateway,
+                &token_program,
+                &recipient_ata,
+                &[TxVersion::V0],
+            )
+            .unwrap(),
+            1
+        );
+        let error = verify_confidential_account_lifecycle(&[orphan], &gateway).unwrap_err();
+        assert!(error.message.contains("initialized and closed"), "{error}");
+
+        let uninitialized_close = dummy_tx(vec![create_record, close_record.clone()], &gateway);
+        let error =
+            verify_confidential_account_lifecycle(&[uninitialized_close], &gateway).unwrap_err();
+        assert!(error.message.contains("uninitialized"), "{error}");
+
+        // Settlement broadcasts bundle transactions sequentially. Creation and
+        // initialization must therefore be atomic: otherwise creation can land
+        // before a later initialization fails, leaving attacker-closable rent.
+        let create_only = dummy_tx(
+            vec![solana_system_interface::instruction::create_account(
+                &gateway,
+                &record,
+                1_000,
+                100,
+                &record_program,
+            )],
+            &gateway,
+        );
+        let initialize_then_close = dummy_tx(
+            vec![initialize_record.clone(), close_record.clone()],
+            &gateway,
+        );
+        let error =
+            verify_confidential_account_lifecycle(&[create_only, initialize_then_close], &gateway)
+                .unwrap_err();
+        assert!(error.message.contains("same transaction"), "{error}");
+
+        let complete = dummy_tx(
+            vec![
+                solana_system_interface::instruction::create_account(
+                    &gateway,
+                    &record,
+                    1_000,
+                    100,
+                    &record_program,
+                ),
+                initialize_record,
+                close_record,
+            ],
+            &gateway,
+        );
+        verify_confidential_account_lifecycle(&[complete], &gateway).unwrap();
+    }
+
     // A Bundle credential must only settle a challenge that was issued in
     // confidential mode. Otherwise a facilitator-mode server (no amount
     // enforcement) would let a client claim any ordinary Token-2022 charge with
@@ -4112,28 +5324,70 @@ mod tests {
             rpc_url: Some("http://127.0.0.1:1".to_string()),
             challenge_binding_secret: Some("x".repeat(32)),
             realm: Some("test".to_string()),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
 
         let request = charge_request(500_000, &Pubkey::new_unique().to_string(), &recipient);
 
-        for confidential in [None, Some(false)] {
+        for mode in [None, Some(false)] {
             let method_details = MethodDetails {
                 token_program: Some(programs::TOKEN_2022_PROGRAM.to_string()),
-                confidential,
+                confidential: mode,
                 ..Default::default()
             };
             let err = mpp
-                .settle_confidential_bundle(&["unused".to_string()], &request, &method_details)
+                .settle_confidential_bundle(
+                    &["unused".to_string()],
+                    &request,
+                    &method_details,
+                    &mut mpp.test_fence().await,
+                )
                 .await
                 .unwrap_err();
             assert!(
                 err.message.contains("confidential mode"),
-                "confidential={confidential:?} got: {}",
+                "confidential={mode:?} got: {}",
                 err.message
             );
         }
+    }
+
+    #[cfg(feature = "confidential")]
+    #[tokio::test]
+    async fn version_one_confidential_settlement_requires_one_transaction() {
+        let recipient = Pubkey::new_unique();
+        let mut mpp = Mpp::new(Config {
+            recipient: recipient.to_string(),
+            currency: "SOL".to_string(),
+            decimals: 6,
+            network: "localnet".to_string(),
+            rpc_url: Some("http://127.0.0.1:1".to_string()),
+            challenge_binding_secret: Some("x".repeat(32)),
+            realm: Some("test".to_string()),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
+            ..Default::default()
+        })
+        .unwrap();
+        mpp.accepted_versions = vec![TxVersion::V1];
+        let request = charge_request(500_000, &Pubkey::new_unique().to_string(), &recipient);
+        let method_details = MethodDetails {
+            token_program: Some(programs::TOKEN_2022_PROGRAM.to_string()),
+            confidential: Some(true),
+            ..Default::default()
+        };
+
+        let err = mpp
+            .settle_confidential_bundle(
+                &["unused".to_string(), "unused".to_string()],
+                &request,
+                &method_details,
+                &mut mpp.test_fence().await,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("exactly one transaction"));
     }
 
     fn charge_request(amount: u64, currency: &str, recipient: &Pubkey) -> ChargeRequest {
@@ -4156,9 +5410,10 @@ mod tests {
         let mpp = test_mpp();
         let request = ChargeRequest {
             amount: "100000".to_string(),
-            currency: "USDC".to_string(),
+            // The endpoint issues the mint, so only the payload type differs.
+            currency: crate::core::mints::USDC_DEVNET.to_string(),
             recipient: Some(TEST_RECIPIENT.to_string()),
-            method_details: Some(serde_json::json!({ "confidential": true })),
+            method_details: Some(serde_json::json!({ "network": "devnet", "confidential": true })),
             ..Default::default()
         };
 
@@ -4166,7 +5421,11 @@ mod tests {
             serde_json::json!({ "type": "transaction", "transaction": "AA==" }),
             serde_json::json!({ "type": "signature", "signature": "fakesig" }),
         ] {
-            let cred = build_credential(&mpp, &request, payload.clone());
+            let cred = PaymentCredential {
+                challenge: sign_unvalidated(&mpp, &request).to_echo(),
+                source: None,
+                payload: payload.clone(),
+            };
             let err = mpp.verify(&cred, &request).await.unwrap_err();
             assert!(
                 err.message.contains("Bundle credential"),
@@ -4174,6 +5433,145 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    // A confidential charge is funded by the gateway, so a caller-built
+    // challenge must name this gateway as its sponsor. A contradictory one
+    // (feePayer false, omitted, or another key) is never signed, and one that
+    // was signed anyway is refused before the gateway co-signs anything.
+    #[cfg(feature = "confidential")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn confidential_challenge_must_be_sponsored_by_this_gateway() {
+        use crate::mpp::protocol::solana::mints;
+        let gateway = test_fee_payer_signer();
+        let gateway_key = gateway.pubkey().to_string();
+        let mpp = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            currency: mints::USDPT_MAINNET.to_string(),
+            decimals: 6,
+            network: "mainnet".to_string(),
+            rpc_url: Some("http://127.0.0.1:1".to_string()),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            realm: Some("test-realm".to_string()),
+            fee_payer_signer: Some(gateway),
+            accept_unverified_confidential_amount: true,
+            store: Some(Arc::new(MemoryStore::new())),
+            ..Default::default()
+        })
+        .unwrap();
+        let request = |fee_payer: Option<bool>, fee_payer_key: Option<String>| ChargeRequest {
+            amount: "1000".to_string(),
+            currency: mints::USDPT_MAINNET.to_string(),
+            recipient: Some(TEST_RECIPIENT.to_string()),
+            method_details: Some(
+                serde_json::to_value(MethodDetails {
+                    network: Some("mainnet".to_string()),
+                    decimals: Some(6),
+                    token_program: Some(programs::TOKEN_2022_PROGRAM.to_string()),
+                    confidential: Some(true),
+                    fee_payer,
+                    fee_payer_key,
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+
+        for contradictory in [
+            request(Some(false), Some(gateway_key.clone())),
+            request(None, Some(gateway_key.clone())),
+            request(Some(true), Some(Pubkey::new_unique().to_string())),
+        ] {
+            let err = mpp
+                .charge_challenge_with_options(&contradictory, None, None)
+                .unwrap_err();
+            assert!(err.to_string().contains("sponsored"), "{err}");
+
+            let credential = PaymentCredential {
+                challenge: sign_unvalidated(&mpp, &contradictory).to_echo(),
+                source: None,
+                payload: serde_json::json!({"type": "bundle", "transactions": ["AA=="]}),
+            };
+            let err = mpp.verify(&credential, &contradictory).await.unwrap_err();
+            assert!(err.message.contains("sponsored"), "{err:?}");
+        }
+
+        // Sponsored by this gateway: issued, and settlement proceeds to the
+        // bundle itself.
+        let sponsored = request(Some(true), Some(gateway_key));
+        let credential = PaymentCredential {
+            challenge: mpp
+                .charge_challenge_with_options(&sponsored, None, None)
+                .unwrap()
+                .to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "bundle", "transactions": ["AA=="]}),
+        };
+        let err = mpp.verify(&credential, &sponsored).await.unwrap_err();
+        assert!(
+            err.message.contains("Invalid transaction at index 0"),
+            "{err:?}"
+        );
+    }
+
+    // A landed push signature stays fetchable indefinitely; only the store's
+    // memory of it prevents a second use. A push challenge must therefore
+    // expire within that memory: no expiry, or a longer one, is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_challenge_must_expire_within_replay_retention() {
+        let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            network: "devnet".to_string(),
+            rpc_url: Some("http://127.0.0.1:1".to_string()),
+            accept_push_mode: true,
+            store: Some(Arc::new(MemoryStore::new())),
+            ..Default::default()
+        })
+        .unwrap();
+        let request = expected_from_challenge(&mpp.charge("0.10").unwrap());
+        let in_two_days = (time::OffsetDateTime::now_utc() + time::Duration::days(2))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+
+        let err = mpp
+            .charge_challenge_with_options(&request, Some(&in_two_days), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("replay retention"), "{err}");
+
+        let push = serde_json::json!({"type": "signature", "signature": "1111"});
+        let mut unbounded = sign_unvalidated(&mpp, &request);
+        for expires in [None, Some(in_two_days)] {
+            unbounded.expires = expires;
+            unbounded.id = compute_challenge_id(
+                &mpp.challenge_binding_secret,
+                &mpp.realm,
+                METHOD_NAME,
+                "charge",
+                unbounded.request.raw(),
+                unbounded.expires.as_deref(),
+                None,
+                None,
+            );
+            let credential = PaymentCredential {
+                challenge: unbounded.to_echo(),
+                source: None,
+                payload: push.clone(),
+            };
+            let err = mpp.verify(&credential, &request).await.unwrap_err();
+            assert!(err.message.contains("replay retention"), "{err:?}");
+        }
+
+        // A default five-minute challenge gets past the window check.
+        let credential = PaymentCredential {
+            challenge: mpp.charge_challenge(&request).unwrap().to_echo(),
+            source: None,
+            payload: push,
+        };
+        let err = mpp.verify(&credential, &request).await.unwrap_err();
+        assert!(!err.message.contains("replay retention"), "{err:?}");
     }
 
     // ── Pre-broadcast SOL verification tests ──
@@ -4192,6 +5590,45 @@ mod tests {
         let method_details = MethodDetails::default();
 
         assert!(verify_transaction_pre_broadcast(&tx, &request, &method_details).is_ok());
+    }
+
+    // RULINGS SIG1: the pull path refuses a transaction whose client
+    // signature does not verify over it, or whose signature list is short,
+    // before anything is co-signed, claimed or sent.
+    #[test]
+    fn a_client_pull_transaction_must_carry_its_own_valid_signatures() {
+        use ed25519_dalek::Signer;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[21u8; 32]);
+        let sender = Pubkey::new_from_array(key.verifying_key().to_bytes());
+        let recipient = Pubkey::new_unique();
+        let amount = 1_000_000u64;
+        let request = charge_request(amount, "SOL", &recipient);
+        let method_details = MethodDetails::default();
+        let versions = [TxVersion::V0, TxVersion::V1];
+        let mut tx = dummy_v0_tx(
+            vec![system_transfer_ix(&sender, &recipient, amount)],
+            &sender,
+            vec![],
+        );
+        let check = |tx: &VersionedTransaction| {
+            verify_client_pull_transaction(tx, &request, &method_details, &versions)
+        };
+
+        assert!(check(&tx).is_err(), "an unsigned client slot passed");
+        tx.signatures[0] = Signature::from(key.sign(&tx.message.serialize()).to_bytes());
+        check(&tx).unwrap();
+
+        let mut forged = tx.clone();
+        forged.signatures[0] =
+            Signature::from(key.sign(b"a transaction that already landed").to_bytes());
+        assert!(
+            check(&forged).is_err(),
+            "a signature over another message passed"
+        );
+
+        let mut truncated = tx.clone();
+        truncated.signatures.clear();
+        assert!(check(&truncated).is_err(), "a short signature list passed");
     }
 
     #[test]
@@ -4385,6 +5822,103 @@ mod tests {
     }
 
     #[test]
+    fn zero_compute_unit_limit_is_rejected() {
+        let fee_payer = Pubkey::new_unique();
+        let sender = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let amount = 500_000u64;
+        let request = charge_request(amount, "SOL", &recipient);
+        let method_details = MethodDetails {
+            fee_payer: Some(true),
+            fee_payer_key: Some(fee_payer.to_string()),
+            ..Default::default()
+        };
+        let with_limit = |units| {
+            dummy_tx(
+                vec![
+                    compute_unit_limit_ix(units),
+                    compute_unit_price_ix(1),
+                    system_transfer_ix(&sender, &recipient, amount),
+                ],
+                &fee_payer,
+            )
+        };
+        let err = verify_transaction_pre_broadcast(&with_limit(0), &request, &method_details)
+            .unwrap_err();
+        assert!(err.message.contains("must be positive"), "{}", err.message);
+        assert!(
+            verify_transaction_pre_broadcast(&with_limit(1), &request, &method_details).is_ok()
+        );
+    }
+
+    #[test]
+    fn fee_sponsored_price_without_limit_is_bounded_by_the_implicit_budget() {
+        let fee_payer = Pubkey::new_unique();
+        let sender = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let split_recipient = Pubkey::new_unique();
+        let (total, split_amount) = (500_000u64, 100_000u64);
+        let request = charge_request(total, "SOL", &recipient);
+        let method_details = MethodDetails {
+            fee_payer: Some(true),
+            fee_payer_key: Some(fee_payer.to_string()),
+            splits: Some(vec![Split {
+                recipient: split_recipient.to_string(),
+                amount: split_amount.to_string(),
+                ata_creation_required: None,
+                label: None,
+                memo: None,
+            }]),
+            ..Default::default()
+        };
+        let payment = |budget: Vec<Instruction>| {
+            let mut ixs = budget;
+            ixs.push(system_transfer_ix(
+                &sender,
+                &recipient,
+                total - split_amount,
+            ));
+            ixs.push(system_transfer_ix(&sender, &split_recipient, split_amount));
+            dummy_tx(ixs, &fee_payer)
+        };
+        // Two transfers and no limit: the runtime budgets 400k CU at the
+        // sponsored price, twice the cap.
+        let price_only = payment(vec![compute_unit_price_ix(
+            MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS_FEE_SPONSORED,
+        )]);
+        let err =
+            verify_transaction_pre_broadcast(&price_only, &request, &method_details).unwrap_err();
+        assert!(
+            err.message.contains("implicit compute unit limit 400000"),
+            "{}",
+            err.message
+        );
+
+        // The same payment with an explicit limit within the cap passes, in
+        // either instruction order.
+        for budget in [
+            vec![
+                compute_unit_price_ix(MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS_FEE_SPONSORED),
+                compute_unit_limit_ix(MAX_COMPUTE_UNIT_LIMIT),
+            ],
+            vec![
+                compute_unit_limit_ix(MAX_COMPUTE_UNIT_LIMIT),
+                compute_unit_price_ix(MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS_FEE_SPONSORED),
+            ],
+        ] {
+            verify_transaction_pre_broadcast(&payment(budget), &request, &method_details).unwrap();
+        }
+        // Duplicated limits are rejected as a whole budget.
+        let duplicated = payment(vec![
+            compute_unit_limit_ix(MAX_COMPUTE_UNIT_LIMIT),
+            compute_unit_limit_ix(1_000),
+        ]);
+        let err =
+            verify_transaction_pre_broadcast(&duplicated, &request, &method_details).unwrap_err();
+        assert!(err.message.contains("duplicate"), "{}", err.message);
+    }
+
+    #[test]
     fn compute_unit_price_fee_sponsored_above_tight_cap_rejected() {
         // Audit #25: a price between the tight fee-sponsored cap and the
         // general cap is what an attacker would use to drain the merchant.
@@ -4476,6 +6010,181 @@ mod tests {
 
         let err = verify_transaction_pre_broadcast(&tx, &request, &method_details).unwrap_err();
         assert!(err.message.contains("Fee payer cannot fund"));
+    }
+
+    // ── Exact payment shape: no extra signers for the sponsor to pay ──
+
+    fn sponsored_by(fee_payer: &Pubkey) -> MethodDetails {
+        MethodDetails {
+            fee_payer: Some(true),
+            fee_payer_key: Some(fee_payer.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn sponsored_spl_fixture() -> (Pubkey, Pubkey, Pubkey, Instruction, ChargeRequest) {
+        let fee_payer = Pubkey::new_unique();
+        let sender = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
+        let tp = token_program_id();
+        let transfer = spl_transfer_checked_ix(
+            &derive_ata(&sender, &mint, &tp),
+            &mint,
+            &derive_ata(&recipient, &mint, &tp),
+            &sender,
+            1_000_000,
+            6,
+        );
+        let mut request = charge_request(1_000_000, "USDC", &recipient);
+        request.external_id = Some("order-1".into());
+        (fee_payer, sender, recipient, transfer, request)
+    }
+
+    /// Splice `extra` into the signer prefix without referencing it from any
+    /// instruction (runtime-valid, but it adds a fee-bearing signature).
+    fn insert_unreferenced_signer(tx: &mut VersionedTransaction, extra: Pubkey) {
+        let VersionedMessage::V0(message) = &mut tx.message else {
+            panic!("expected a version-0 message");
+        };
+        message.account_keys.splice(1..1, [extra]);
+        for ix in &mut message.instructions {
+            if ix.program_id_index >= 1 {
+                ix.program_id_index += 1;
+            }
+            for account in &mut ix.accounts {
+                if *account >= 1 {
+                    *account += 1;
+                }
+            }
+        }
+        message.header.num_required_signatures += 1;
+        tx.signatures.insert(1, Signature::default());
+    }
+
+    #[test]
+    fn sponsored_spl_transfer_with_memo_passes() {
+        let (fee_payer, _, _, transfer, request) = sponsored_spl_fixture();
+        let tx = dummy_tx(vec![transfer, memo_ix("order-1")], &fee_payer);
+        verify_transaction_pre_broadcast(&tx, &request, &sponsored_by(&fee_payer)).unwrap();
+    }
+
+    #[test]
+    fn sponsored_spl_transfer_with_extra_signer_account_rejected() {
+        let (fee_payer, _, _, mut transfer, request) = sponsored_spl_fixture();
+        transfer
+            .accounts
+            .push(AccountMeta::new_readonly(Pubkey::new_unique(), true));
+        let tx = dummy_tx(vec![transfer, memo_ix("order-1")], &fee_payer);
+        let err =
+            verify_transaction_pre_broadcast(&tx, &request, &sponsored_by(&fee_payer)).unwrap_err();
+        assert!(err.message.contains("No matching SPL"), "{}", err.message);
+    }
+
+    #[test]
+    fn sponsored_memo_with_signer_account_rejected() {
+        let (fee_payer, _, _, transfer, request) = sponsored_spl_fixture();
+        let mut memo = memo_ix("order-1");
+        memo.accounts
+            .push(AccountMeta::new_readonly(Pubkey::new_unique(), true));
+        let tx = dummy_tx(vec![transfer, memo], &fee_payer);
+        let err =
+            verify_transaction_pre_broadcast(&tx, &request, &sponsored_by(&fee_payer)).unwrap_err();
+        assert!(
+            err.message.contains("No memo instruction"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn sol_transfer_with_trailing_signer_account_rejected() {
+        let fee_payer = Pubkey::new_unique();
+        let sender = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let mut transfer = system_transfer_ix(&sender, &recipient, 500_000);
+        transfer
+            .accounts
+            .push(AccountMeta::new_readonly(Pubkey::new_unique(), true));
+        let tx = dummy_tx(vec![transfer], &fee_payer);
+        let request = charge_request(500_000, "SOL", &recipient);
+        let err =
+            verify_transaction_pre_broadcast(&tx, &request, &sponsored_by(&fee_payer)).unwrap_err();
+        assert!(err.message.contains("No matching SOL"), "{}", err.message);
+    }
+
+    #[test]
+    fn unreferenced_signer_rejected_for_sol_and_spl() {
+        let (fee_payer, _, _, transfer, request) = sponsored_spl_fixture();
+        let mut tx = dummy_tx(vec![transfer, memo_ix("order-1")], &fee_payer);
+        insert_unreferenced_signer(&mut tx, Pubkey::new_unique());
+        tx.sanitize().unwrap();
+        let err =
+            verify_transaction_pre_broadcast(&tx, &request, &sponsored_by(&fee_payer)).unwrap_err();
+        assert!(err.message.contains("Unexpected signer"), "{}", err.message);
+
+        let sender = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let mut tx = dummy_tx(
+            vec![system_transfer_ix(&sender, &recipient, 500_000)],
+            &fee_payer,
+        );
+        insert_unreferenced_signer(&mut tx, Pubkey::new_unique());
+        let request = charge_request(500_000, "SOL", &recipient);
+        let err =
+            verify_transaction_pre_broadcast(&tx, &request, &sponsored_by(&fee_payer)).unwrap_err();
+        assert!(err.message.contains("Unexpected signer"), "{}", err.message);
+
+        // Client-paid: the payer is both fee payer and transfer authority.
+        let tx = dummy_tx(
+            vec![system_transfer_ix(&sender, &recipient, 500_000)],
+            &sender,
+        );
+        verify_transaction_pre_broadcast(&tx, &request, &MethodDetails::default()).unwrap();
+    }
+
+    // A sponsor pays a signature fee per required signer, so the legs of a
+    // split must all be funded by one authority, not one signer per leg.
+    #[test]
+    fn sponsored_split_legs_must_share_one_funding_authority() {
+        let fee_payer = Pubkey::new_unique();
+        let (primary, split_recipient) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let request = charge_request(1_000_000, "SOL", &primary);
+        let details = MethodDetails {
+            splits: Some(vec![Split {
+                recipient: split_recipient.to_string(),
+                amount: "200000".to_string(),
+                ata_creation_required: None,
+                label: None,
+                memo: None,
+            }]),
+            ..sponsored_by(&fee_payer)
+        };
+        let (payer, other_payer) = (Pubkey::new_unique(), Pubkey::new_unique());
+
+        let tx = dummy_tx(
+            vec![
+                system_transfer_ix(&payer, &primary, 800_000),
+                system_transfer_ix(&other_payer, &split_recipient, 200_000),
+            ],
+            &fee_payer,
+        );
+        assert_eq!(tx.message.header().num_required_signatures, 3);
+        let err = verify_transaction_pre_broadcast(&tx, &request, &details).unwrap_err();
+        assert!(
+            err.message.contains("one funding authority"),
+            "{}",
+            err.message
+        );
+
+        let tx = dummy_tx(
+            vec![
+                system_transfer_ix(&payer, &primary, 800_000),
+                system_transfer_ix(&payer, &split_recipient, 200_000),
+            ],
+            &fee_payer,
+        );
+        verify_transaction_pre_broadcast(&tx, &request, &details).unwrap();
     }
 
     // ── Pre-broadcast SPL verification tests ──
@@ -4867,9 +6576,11 @@ mod tests {
 
     fn test_mpp() -> Mpp {
         Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap()
@@ -4877,11 +6588,13 @@ mod tests {
 
     fn test_mpp_sol() -> Mpp {
         Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: "SOL".to_string(),
             decimals: 9,
             network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap()
@@ -4991,11 +6704,13 @@ mod tests {
         let signer: Arc<dyn solana_keychain::TransactionSigner> =
             Arc::new(TransactionOnlySigner(fee_payer));
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             network: "devnet".to_string(),
             fee_payer: true,
             fee_payer_signer: Some(Arc::clone(&signer)),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -5033,11 +6748,13 @@ mod tests {
         let signer: Arc<dyn solana_keychain::TransactionSigner> =
             Arc::new(TransactionOnlySigner(sponsor));
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             network: "devnet".to_string(),
             fee_payer: true,
             fee_payer_signer: Some(Arc::clone(&signer)),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -5082,8 +6799,10 @@ mod tests {
     #[test]
     fn new_missing_recipient_errors() {
         let err = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: String::new(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .err()
@@ -5097,8 +6816,10 @@ mod tests {
     #[test]
     fn new_invalid_recipient_pubkey_errors() {
         let err = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: "not-a-valid-pubkey!!!".to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .err()
@@ -5117,8 +6838,10 @@ mod tests {
         unsafe { std::env::remove_var(SECRET_KEY_ENV_VAR) };
 
         let err = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: None,
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .err()
@@ -5143,8 +6866,10 @@ mod tests {
         };
 
         let result = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: None,
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         });
 
@@ -5162,8 +6887,10 @@ mod tests {
     fn new_rejects_empty_secret_key() {
         // Audit #24: short keys weaken the HMAC binding.
         let err = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(String::new()),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .err()
@@ -5179,8 +6906,10 @@ mod tests {
         // Just below the 32-byte minimum.
         let short = "a".repeat(MIN_SECRET_KEY_BYTES - 1);
         let err = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(short),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .err()
@@ -5195,8 +6924,10 @@ mod tests {
     fn new_accepts_secret_key_at_minimum_length() {
         let exact = "a".repeat(MIN_SECRET_KEY_BYTES);
         let result = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(exact),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         });
         assert!(result.is_ok());
@@ -5210,8 +6941,10 @@ mod tests {
         unsafe { std::env::set_var(SECRET_KEY_ENV_VAR, "too-short") };
 
         let result = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: None,
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         });
 
@@ -5231,9 +6964,8 @@ mod tests {
     #[test]
     fn new_valid_config_succeeds() {
         let mpp = test_mpp();
-        // Audit #15: default realm now derives from recipient.
-        assert_eq!(mpp.realm(), derive_default_realm(TEST_RECIPIENT));
-        assert_eq!(mpp.currency(), "USDC");
+        assert_eq!(mpp.realm(), "test-realm");
+        assert_eq!(mpp.currency(), crate::core::mints::USDC_DEVNET);
         assert_eq!(mpp.recipient(), TEST_RECIPIENT);
         assert_eq!(mpp.decimals(), 6);
     }
@@ -5244,66 +6976,154 @@ mod tests {
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             realm: Some("Custom Realm".to_string()),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
         assert_eq!(mpp.realm(), "Custom Realm");
     }
 
-    // ── Audit #15: derived default realm ──
+    // ── Realm is required: no shared default namespace ──
 
     #[test]
-    fn new_default_realm_format() {
-        // The derived default looks like "App Id - #<digits>" (max 8).
-        let realm = derive_default_realm(TEST_RECIPIENT);
-        assert!(
-            realm.starts_with("App Id - #"),
-            "unexpected realm format: {realm}"
+    fn new_requires_a_replay_store() {
+        let err = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            network: "devnet".to_string(),
+            realm: Some("test-realm".to_string()),
+            ..Default::default()
+        })
+        .err()
+        .expect("missing store must fail");
+        assert!(err.to_string().contains("store is required"), "{err}");
+    }
+
+    // Per-request `Mpp` instances (the cancel-endpoint shape) must share one
+    // ledger: a second presentation of the challenge, built on a fresh
+    // instance, is recognised instead of settling again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn per_request_instances_sharing_a_store_settle_a_challenge_once() {
+        let instance = |store: Arc<dyn Store>| {
+            Mpp::new(Config {
+                recipient: TEST_RECIPIENT.to_string(),
+                challenge_binding_secret: Some(TEST_SECRET.to_string()),
+                currency: "SOL".to_string(),
+                decimals: 9,
+                network: "devnet".to_string(),
+                rpc_url: Some("http://127.0.0.1:1".to_string()),
+                realm: Some("test-realm".to_string()),
+                store: Some(store),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let shared: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let issuer = instance(shared.clone());
+        let challenge = issuer.charge("0.000001").unwrap();
+        let expected: ChargeRequest = challenge.request.decode().unwrap();
+        let first = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::json!({ "type": "transaction", "transaction": "AA==" }),
         );
-        let digits = realm.trim_start_matches("App Id - #");
-        assert!(digits.chars().all(|c| c.is_ascii_digit()), "got: {realm}");
-        assert!(!digits.is_empty() && digits.len() <= 8, "got: {realm}");
+        let mut second = first.clone();
+        second.payload = serde_json::json!({ "type": "transaction", "transaction": "AQ==" });
+
+        instance(shared.clone())
+            .verify_credential_with_expected(&first, &expected)
+            .await
+            .unwrap_err();
+        let err = instance(shared)
+            .verify_credential_with_expected(&second, &expected)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("already presented"), "{}", err.message);
+
+        // Control: isolated stores are what let a replay through.
+        let err = instance(Arc::new(MemoryStore::new()))
+            .verify_credential_with_expected(&second, &expected)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.message.contains("already presented"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
-    fn new_default_realm_deterministic_for_same_recipient() {
-        // Restart-safe: same recipient must always derive to the same realm,
-        // otherwise in-flight challenges would fail to verify after a deploy.
-        let a = derive_default_realm(TEST_RECIPIENT);
-        let b = derive_default_realm(TEST_RECIPIENT);
-        assert_eq!(a, b);
+    fn new_requires_a_realm() {
+        let err = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
+            ..Default::default()
+        })
+        .err()
+        .expect("missing realm must fail");
+        assert!(err.to_string().contains("realm is required"), "{err}");
     }
 
-    #[test]
-    fn new_default_realm_differs_across_recipients() {
-        // Two servers with shared secret but different recipients must end
-        // up with different default realms — closes the audit threat shape
-        // (shared MPP_SECRET_KEY + shared default realm == shared
-        // credential namespace).
-        let other = "8tNDNRkk3JG1WK9NSRwUjytkGwY6Jq6gqQwNFmKt3pkP";
-        assert_ne!(
-            derive_default_realm(TEST_RECIPIENT),
-            derive_default_realm(other),
+    // Two services sharing recipient and secret: with distinct realms, a
+    // credential issued by one cannot settle on the other.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn services_sharing_recipient_and_secret_do_not_share_credentials() {
+        let service = |realm: &str| {
+            Mpp::new(Config {
+                recipient: TEST_RECIPIENT.to_string(),
+                challenge_binding_secret: Some(TEST_SECRET.to_string()),
+                currency: "SOL".to_string(),
+                decimals: 9,
+                network: "devnet".to_string(),
+                rpc_url: Some("http://127.0.0.1:1".to_string()),
+                realm: Some(realm.to_string()),
+                store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let a = service("service-a");
+        let challenge = a.charge("0.000001").unwrap();
+        let expected: ChargeRequest = challenge.request.decode().unwrap();
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::json!({ "type": "transaction", "transaction": "AA==" }),
+        );
+        let err = service("service-b")
+            .verify_credential_with_expected(&credential, &expected)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("Challenge ID mismatch"),
+            "{}",
+            err.message
+        );
+
+        // Control: a replica of service A (same realm) authenticates it.
+        let err = service("service-a")
+            .verify_credential_with_expected(&credential, &expected)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.message.contains("Challenge ID mismatch"),
+            "{}",
+            err.message
         );
     }
 
     #[test]
     fn new_rejects_empty_realm() {
-        // Explicitly providing an empty realm bypasses the derivation —
-        // reject so an operator can't reintroduce the audit threat with a
-        // typo.
         let err = Mpp::new(Config {
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             realm: Some(String::new()),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .err()
         .expect("empty realm should be rejected");
-        assert!(
-            err.to_string().contains("realm must be non-empty"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("realm is required"), "got: {err}");
     }
 
     // ── Audit #37: network allowlist + mainnet canonicalization ──
@@ -5312,9 +7132,11 @@ mod tests {
     fn new_accepts_canonical_networks() {
         for net in ["mainnet", "devnet", "localnet"] {
             Mpp::new(Config {
+                realm: Some("test-realm".to_string()),
                 recipient: TEST_RECIPIENT.to_string(),
                 challenge_binding_secret: Some(TEST_SECRET.to_string()),
                 network: net.to_string(),
+                store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
                 ..Default::default()
             })
             .unwrap_or_else(|e| panic!("{net} should be accepted: {e}"));
@@ -5324,9 +7146,11 @@ mod tests {
     #[test]
     fn new_rejects_unknown_network() {
         let err = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             network: "testnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .err()
@@ -5337,9 +7161,11 @@ mod tests {
     #[test]
     fn new_rejects_empty_network() {
         let err = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             network: String::new(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .err()
@@ -5355,9 +7181,11 @@ mod tests {
         // Audit #37: canonicalize on "mainnet" — the legacy "mainnet-beta"
         // is an RPC hostname, not a wire-format slug.
         let err = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             network: "mainnet-beta".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .err()
@@ -5369,9 +7197,11 @@ mod tests {
     fn new_custom_rpc_url() {
         // Should not fail — just verifying it accepts a custom RPC URL.
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             rpc_url: Some("http://custom:8899".to_string()),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         });
         assert!(mpp.is_ok());
@@ -5381,6 +7211,7 @@ mod tests {
     fn new_custom_store() {
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
         let result = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             store: Some(store),
@@ -5394,10 +7225,12 @@ mod tests {
     #[test]
     fn new_resolves_token_program_for_sol_currency() {
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: "SOL".to_string(),
             decimals: 9,
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -5416,10 +7249,12 @@ mod tests {
         // PYUSD is Token-2022; if this returns the legacy Token Program
         // (the old bug), the regression is back.
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: "PYUSD".to_string(),
             network: "mainnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -5431,9 +7266,11 @@ mod tests {
         // Not a known symbol and not a valid base58 pubkey — must reject
         // up front, never silently fall back to the legacy Token Program.
         let err = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: "not-a-symbol-or-mint!!".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .err()
@@ -5449,11 +7286,13 @@ mod tests {
     #[test]
     fn new_rejects_fee_payer_true_without_signer() {
         let err = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             fee_payer: true,
             fee_payer_signer: None,
             network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .err()
@@ -5484,11 +7323,13 @@ mod tests {
         // Regression: the default config has no signer and fee_payer=false;
         // it must keep working.
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             fee_payer: false,
             fee_payer_signer: None,
             network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .expect("default fee_payer=false should be accepted");
@@ -5500,11 +7341,13 @@ mod tests {
         // Mpp is configured fee_payer=false, no signer. A per-call
         // ChargeOptions.fee_payer = true override must be rejected.
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             fee_payer: false,
             fee_payer_signer: None,
             network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -5516,8 +7359,7 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .err()
-            .expect("per-call fee_payer without signer should be rejected");
+            .expect_err("per-call fee_payer without signer should be rejected");
         assert!(
             err.to_string().contains("no fee_payer_signer"),
             "got: {err}"
@@ -5528,11 +7370,13 @@ mod tests {
     fn charge_options_fee_payer_succeeds_when_signer_configured() {
         // Happy path: server has a signer, per-call override works.
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             fee_payer: false,
             fee_payer_signer: Some(test_fee_payer_signer()),
             network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -5564,7 +7408,7 @@ mod tests {
         let mpp = test_mpp();
         let challenge = mpp.charge("0.10").unwrap();
 
-        assert_eq!(challenge.realm, derive_default_realm(TEST_RECIPIENT));
+        assert_eq!(challenge.realm, "test-realm");
         assert_eq!(challenge.method.as_str(), "solana");
         assert_eq!(challenge.intent.as_str(), "charge");
         assert!(!challenge.id.is_empty());
@@ -5573,7 +7417,7 @@ mod tests {
         // Decode the request and verify fields.
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert_eq!(request.amount, "100000"); // 0.10 * 10^6
-        assert_eq!(request.currency, "USDC");
+        assert_eq!(request.currency, crate::core::mints::USDC_DEVNET);
         assert_eq!(request.recipient.as_deref(), Some(TEST_RECIPIENT));
     }
 
@@ -5584,7 +7428,7 @@ mod tests {
 
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert_eq!(request.amount, "1000000000"); // 1 SOL = 10^9 lamports
-        assert_eq!(request.currency, "SOL");
+        assert_eq!(request.currency, "sol");
     }
 
     #[test]
@@ -5698,8 +7542,7 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .err()
-            .expect("invalid split recipient should be rejected");
+            .expect_err("invalid split recipient should be rejected");
         assert!(
             format!("{err}").contains("invalid recipient pubkey"),
             "got: {err}"
@@ -5760,8 +7603,7 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .err()
-            .expect("too many splits should be rejected");
+            .expect_err("too many splits should be rejected");
         assert!(matches!(err, Error::TooManySplits));
     }
 
@@ -5787,8 +7629,7 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .err()
-            .expect("should reject primary recipient with ataCreationRequired");
+            .expect_err("should reject primary recipient with ataCreationRequired");
         let msg = err.to_string();
         assert!(
             msg.contains("top-level recipient"),
@@ -5923,7 +7764,7 @@ mod tests {
             ..Default::default()
         };
         let err = mpp.charge_challenge(&request).unwrap_err();
-        assert!(format!("{err}").contains("does not match server-configured currency"));
+        assert!(format!("{err}").contains("does not match server wire currency"));
     }
 
     #[test]
@@ -6095,6 +7936,23 @@ mod tests {
 
     // ── verify() — HMAC mismatch, expiry, replay protection ──
 
+    /// An authenticated challenge for `request` that skips issuance
+    /// validation, standing in for one issued by an older or differently
+    /// configured replica: verification must hold on its own.
+    fn sign_unvalidated(mpp: &Mpp, request: &ChargeRequest) -> PaymentChallenge {
+        PaymentChallenge::with_challenge_binding_secret_full(
+            &mpp.challenge_binding_secret,
+            &mpp.realm,
+            METHOD_NAME,
+            "charge",
+            Base64UrlJson::from_typed(request).unwrap(),
+            Some(&crate::mpp::expires::minutes(5)),
+            None,
+            None,
+            None,
+        )
+    }
+
     fn build_credential(
         mpp: &Mpp,
         request: &ChargeRequest,
@@ -6198,6 +8056,7 @@ mod tests {
             amount: "100000".to_string(),
             currency: "USDC".to_string(),
             recipient: Some(TEST_RECIPIENT.to_string()),
+            method_details: Some(serde_json::json!({ "network": "devnet" })),
             ..Default::default()
         };
         // Payload missing the "type" tag needed for CredentialPayload deserialization.
@@ -6365,9 +8224,11 @@ mod tests {
     async fn verify_credential_with_expected_authenticates_before_route_validation() {
         let issuer = test_mpp();
         let verifier = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some("another-server-secret-at-least-32-bytes".to_string()),
             network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -6548,6 +8409,38 @@ mod tests {
         );
     }
 
+    // A challenge issued in confidential mode can only be settled by a
+    // confidential Bundle; an expectation rebuilt without the flag (a generic
+    // amount-based route) must not let a cleartext transfer settle it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_credential_with_expected_confidential_mismatch() {
+        let mpp = test_mpp();
+        let plain = expected_from_challenge(&mpp.charge("0.10").unwrap());
+        let mut confidential = plain.clone();
+        mutate_method_details(&mut confidential, |md| md.confidential = Some(true));
+        let cred = PaymentCredential {
+            challenge: sign_unvalidated(&mpp, &confidential).to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "x"}),
+        };
+
+        let err = mpp
+            .verify_credential_with_expected(&cred, &plain)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("methodDetails.confidential mismatch"),
+            "got: {err:?}"
+        );
+        // Against its own (confidential) expectation it gets past the
+        // comparison to the settlement-mode check.
+        let err = mpp
+            .verify_credential_with_expected(&cred, &confidential)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("Bundle credential"), "got: {err:?}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn verify_credential_with_expected_splits_mismatch() {
         let mpp = test_mpp();
@@ -6602,7 +8495,7 @@ mod tests {
             .verify_credential_with_expected(&cred, &expected)
             .await
             .unwrap_err();
-        let msg = format!("{}", err.message);
+        let msg = err.message.to_string();
         assert!(
             !msg.contains("recentBlockhash mismatch") && !msg.contains("recent_blockhash mismatch"),
             "comparison should not reject on blockhash, got: {err:?}"
@@ -6838,11 +8731,13 @@ mod tests {
         // (e.g. on-chain verification against a fake signature) is fine,
         // just not the "Push-mode credentials are disabled" one.
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: crate::mpp::protocol::solana::mints::USDC_DEVNET.to_string(),
             network: "devnet".to_string(),
             accept_push_mode: true,
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -6881,6 +8776,7 @@ mod tests {
         // the B34 fee-payer-specific path in isolation, opt push mode in
         // here so the audit #5 gate passes and B34 fires.
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: crate::mpp::protocol::solana::mints::USDC_DEVNET.to_string(),
@@ -6888,6 +8784,7 @@ mod tests {
             fee_payer_signer: Some(test_fee_payer_signer()),
             network: "devnet".to_string(),
             accept_push_mode: true,
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -6920,12 +8817,14 @@ mod tests {
         // We do not drive broadcast here, only assert the early reject does
         // not fire: any error must come from broadcast, not from B34.
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: crate::mpp::protocol::solana::mints::USDC_DEVNET.to_string(),
             fee_payer: true,
             fee_payer_signer: Some(test_fee_payer_signer()),
             network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -6949,12 +8848,1271 @@ mod tests {
         );
     }
 
+    // A transaction signed for challenge A cannot settle challenge B: the
+    // signed blockhash must be the one B's authenticated echo carries, not the
+    // caller's freshly rebuilt expectation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pull_transaction_must_use_the_challenged_blockhash() {
+        let challenged = Hash::new_unique();
+        let issued = |blockhash: Hash| ChargeRequest {
+            amount: "1000".into(),
+            currency: "SOL".into(),
+            recipient: Some(TEST_RECIPIENT.into()),
+            method_details: Some(serde_json::json!({
+                "network": "devnet",
+                "decimals": 9,
+                "recentBlockhash": blockhash.to_string(),
+            })),
+            ..Default::default()
+        };
+        let expected = issued(Hash::new_unique());
+        let sender = seed_pubkey(9);
+        let recipient = Pubkey::from_str(TEST_RECIPIENT).unwrap();
+
+        for (signed_with, rejected) in [(Hash::new_unique(), true), (challenged, false)] {
+            let mpp = Mpp::new(Config {
+                realm: Some("test-realm".to_string()),
+                recipient: TEST_RECIPIENT.to_string(),
+                challenge_binding_secret: Some(TEST_SECRET.to_string()),
+                currency: "SOL".to_string(),
+                decimals: 9,
+                network: "devnet".to_string(),
+                rpc_url: Some("http://127.0.0.1:1".to_string()),
+                store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut tx = crate::core::tx::build_unsigned_unchecked(
+                TxVersion::V0,
+                &sender,
+                &[system_transfer_ix(&sender, &recipient, 1000)],
+                signed_with,
+                None,
+            )
+            .unwrap();
+            sign_slot0(&mut tx, 9);
+            let transaction = crate::core::tx::encode(&tx).unwrap();
+            let cred = build_credential(
+                &mpp,
+                &issued(challenged),
+                serde_json::json!({ "type": "transaction", "transaction": transaction }),
+            );
+            let err = mpp.verify(&cred, &expected).await.unwrap_err();
+            let reached = if rejected {
+                "challenged blockhash"
+            } else {
+                "Broadcast RPC error"
+            };
+            assert!(err.message.contains(reached), "{}", err.message);
+        }
+    }
+
+    // ── Ambiguous confirmation is pending, not failed ──
+
+    /// JSON-RPC stub: `sendTransaction` returns `signature`, or the sent
+    /// transaction's own first signature when it is `None`; `status`
+    /// selects the signature status (0 unknown, 1 landed ok, 2 landed failed)
+    /// and `blockhash_valid` the blockhash validity.
+    async fn stub_rpc(
+        signature: Option<Signature>,
+        status: Arc<std::sync::atomic::AtomicU8>,
+        blockhash_valid: Arc<std::sync::atomic::AtomicBool>,
+    ) -> String {
+        stub_rpc_counting(
+            signature,
+            status,
+            blockhash_valid,
+            Arc::default(),
+            Arc::default(),
+        )
+        .await
+    }
+
+    /// [`stub_rpc`] that also counts `sendTransaction` calls in `sends`, and
+    /// answers them with the JSON-RPC error in `send_error` while it is set.
+    async fn stub_rpc_counting(
+        signature: Option<Signature>,
+        status: Arc<std::sync::atomic::AtomicU8>,
+        blockhash_valid: Arc<std::sync::atomic::AtomicBool>,
+        sends: Arc<std::sync::atomic::AtomicUsize>,
+        send_error: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    ) -> String {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::Ordering;
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let (status, blockhash_valid, sends, send_error) = (
+                    status.clone(),
+                    blockhash_valid.clone(),
+                    sends.clone(),
+                    send_error.clone(),
+                );
+                async move {
+                    let context = serde_json::json!({ "slot": 1 });
+                    let result = match request["method"].as_str() {
+                        Some("sendTransaction") => {
+                            sends.fetch_add(1, Ordering::SeqCst);
+                            if let Some(error) = send_error.lock().unwrap().clone() {
+                                return Json(serde_json::json!({
+                                    "jsonrpc": "2.0", "id": request["id"], "error": error,
+                                }));
+                            }
+                            let own = || {
+                                crate::core::tx::decode(request["params"][0].as_str().unwrap())
+                                    .unwrap()
+                                    .signatures[0]
+                            };
+                            serde_json::json!(signature.unwrap_or_else(own).to_string())
+                        }
+                        Some("isBlockhashValid") => serde_json::json!({
+                            "context": context,
+                            "value": blockhash_valid.load(Ordering::SeqCst),
+                        }),
+                        Some("getSignatureStatuses") => {
+                            let entry = match status.load(Ordering::SeqCst) {
+                                1 => serde_json::json!({
+                                    "slot": 1, "confirmations": null, "err": null,
+                                    "status": { "Ok": null }, "confirmationStatus": "confirmed",
+                                }),
+                                2 => serde_json::json!({
+                                    "slot": 1, "confirmations": null,
+                                    "err": { "InstructionError": [0, { "Custom": 1 }] },
+                                    "status": { "Err": { "InstructionError": [0, { "Custom": 1 }] } },
+                                    "confirmationStatus": "confirmed",
+                                }),
+                                _ => serde_json::Value::Null,
+                            };
+                            serde_json::json!({ "context": context, "value": [entry] })
+                        }
+                        other => panic!("unexpected RPC method {other:?}"),
+                    };
+                    Json(serde_json::json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    struct AmbiguousCharge {
+        mpp: Mpp,
+        store: Arc<MemoryStore>,
+        credential: PaymentCredential,
+        expected: ChargeRequest,
+        signature: Signature,
+        status: Arc<std::sync::atomic::AtomicU8>,
+        blockhash_valid: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// A SOL pull charge whose broadcast is accepted but never observed.
+    async fn ambiguous_charge() -> (AmbiguousCharge, VerificationError) {
+        ambiguous_charge_expiring(None).await
+    }
+
+    async fn ambiguous_charge_expiring(
+        expires: Option<&str>,
+    ) -> (AmbiguousCharge, VerificationError) {
+        let status = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let blockhash_valid = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let rpc_url = stub_rpc(None, status.clone(), blockhash_valid.clone()).await;
+        let store = Arc::new(MemoryStore::new());
+        let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
+            decimals: 9,
+            network: "devnet".to_string(),
+            rpc_url: Some(rpc_url),
+            store: Some(store.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let blockhash = Hash::new_unique();
+        let expected = ChargeRequest {
+            amount: "1000".into(),
+            currency: "SOL".into(),
+            recipient: Some(TEST_RECIPIENT.into()),
+            method_details: Some(serde_json::json!({
+                "network": "devnet",
+                "decimals": 9,
+                "recentBlockhash": blockhash.to_string(),
+            })),
+            ..Default::default()
+        };
+        let sender = seed_pubkey(7);
+        let mut tx = crate::core::tx::build_unsigned_unchecked(
+            TxVersion::V0,
+            &sender,
+            &[system_transfer_ix(
+                &sender,
+                &Pubkey::from_str(TEST_RECIPIENT).unwrap(),
+                1000,
+            )],
+            blockhash,
+            None,
+        )
+        .unwrap();
+        let signature = sign_slot0(&mut tx, 7);
+        let payload = serde_json::json!({
+            "type": "transaction",
+            "transaction": crate::core::tx::encode(&tx).unwrap(),
+        });
+        let credential = match expires {
+            Some(expires) => build_credential_with_expires(&mpp, &expected, expires, payload),
+            None => build_credential(&mpp, &expected, payload),
+        };
+        let first = mpp.verify(&credential, &expected).await.unwrap_err();
+        (
+            AmbiguousCharge {
+                mpp,
+                store,
+                credential,
+                expected,
+                signature,
+                status,
+                blockhash_valid,
+            },
+            first,
+        )
+    }
+
+    /// The latest generation of a charge record.
+    async fn charge_record(
+        store: &MemoryStore,
+        challenge_id: &str,
+    ) -> crate::mpp::store::ChargeRecord {
+        let mut raw = store
+            .get(&format!("solana-charge:record:{challenge_id}"))
+            .await
+            .unwrap()
+            .unwrap();
+        for generation in 1.. {
+            match store
+                .get(&format!("solana-charge:record:{challenge_id}:{generation}"))
+                .await
+                .unwrap()
+            {
+                Some(next) => raw = next,
+                None => break,
+            }
+        }
+        serde_json::from_value(raw).unwrap()
+    }
+
+    /// A [`MemoryStore`] whose `put_if_absent` fails while `failing` is set
+    /// for keys starting with `prefix` (and, with `only_state`, only for a
+    /// value whose `state` is that one).
+    struct FlakyStore {
+        inner: MemoryStore,
+        prefix: &'static str,
+        failing: std::sync::atomic::AtomicBool,
+        only_state: Option<&'static str>,
+    }
+
+    impl Store for FlakyStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Option<serde_json::Value>, crate::mpp::store::StoreError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            self.inner.get(key)
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), crate::mpp::store::StoreError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.inner.put(key, value)
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), crate::mpp::store::StoreError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.inner.delete(key)
+        }
+
+        fn put_if_absent(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<bool, crate::mpp::store::StoreError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            if key.starts_with(self.prefix)
+                && self.failing.load(std::sync::atomic::Ordering::SeqCst)
+                && self
+                    .only_state
+                    .is_none_or(|state| value["state"] == serde_json::json!(state))
+            {
+                return Box::pin(async {
+                    Err(crate::mpp::store::StoreError::Internal(
+                        "injected store outage".into(),
+                    ))
+                });
+            }
+            self.inner.put_if_absent(key, value)
+        }
+
+        fn put_if_eq(
+            &self,
+            key: &str,
+            expected: Option<serde_json::Value>,
+            value: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<bool, crate::mpp::store::StoreError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.inner.put_if_eq(key, expected, value)
+        }
+    }
+
+    /// The deterministic test signer for `seed`.
+    fn seed_key(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn seed_pubkey(seed: u8) -> Pubkey {
+        Pubkey::from(seed_key(seed).verifying_key().to_bytes())
+    }
+
+    /// Sign slot 0 of `tx` with the `seed` signer, returning the signature.
+    fn sign_slot0(tx: &mut VersionedTransaction, seed: u8) -> Signature {
+        use ed25519_dalek::Signer as _;
+        let signature = Signature::from(seed_key(seed).sign(&tx.message.serialize()).to_bytes());
+        tx.signatures[0] = signature;
+        signature
+    }
+
+    /// A SOL pull credential for a fresh challenge on `mpp`, signed by the
+    /// `seed` signer, with its transaction's signature.
+    fn signed_pull_credential(
+        mpp: &Mpp,
+        seed: u8,
+    ) -> (PaymentCredential, ChargeRequest, Signature) {
+        let blockhash = Hash::new_unique();
+        let expected = ChargeRequest {
+            amount: "1000".into(),
+            currency: "SOL".into(),
+            recipient: Some(TEST_RECIPIENT.into()),
+            method_details: Some(serde_json::json!({
+                "network": "devnet",
+                "decimals": 9,
+                "recentBlockhash": blockhash.to_string(),
+            })),
+            ..Default::default()
+        };
+        let sender = seed_pubkey(seed);
+        let mut tx = crate::core::tx::build_unsigned_unchecked(
+            TxVersion::V0,
+            &sender,
+            &[system_transfer_ix(
+                &sender,
+                &Pubkey::from_str(TEST_RECIPIENT).unwrap(),
+                1000,
+            )],
+            blockhash,
+            None,
+        )
+        .unwrap();
+        let signature = sign_slot0(&mut tx, seed);
+        let payload = serde_json::json!({
+            "type": "transaction",
+            "transaction": crate::core::tx::encode(&tx).unwrap(),
+        });
+        (
+            build_credential(mpp, &expected, payload),
+            expected,
+            signature,
+        )
+    }
+
+    // The signature is claimed before the broadcast, so a replay store that
+    // fails provably sent nothing: no payment can land unrecorded and then be
+    // paid again under a fresh challenge.
+    // The signature is claimed before the pending record a retry would grant
+    // is written, so a signature that already paid another challenge never
+    // exposes a pending charge a concurrent retry could confirm.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_signature_claim_exposes_no_pending_charge() {
+        let mpp = test_mpp();
+        let paid = Signature::from([21u8; 64]).to_string();
+        mpp.consume_signature(&paid).await.unwrap();
+
+        let mut fence = mpp.test_fence().await;
+        let err = fence.begin(&mpp, &paid).await.unwrap_err();
+        assert_eq!(err.code, Some("signature-consumed"), "{err:?}");
+        assert!(fence.pending.is_none());
+        assert!(fence
+            .store
+            .pending(&fence.challenge_id, "test-digest")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Positive control: a fresh signature is claimed, then recorded.
+        let fresh = Signature::from([22u8; 64]).to_string();
+        let mut fence = mpp.test_fence().await;
+        fence.begin(&mpp, &fresh).await.unwrap();
+        assert_eq!(
+            fence
+                .store
+                .pending(&fence.challenge_id, "test-digest")
+                .await
+                .unwrap()
+                .map(|(_, signature)| signature),
+            Some(fresh.clone())
+        );
+        assert!(mpp.consume_signature(&fresh).await.is_err());
+    }
+
+    // A fence whose reservation was taken over writes nothing and sends
+    // nothing, so it gives back the signature it claimed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_superseded_fence_releases_its_signature_claim() {
+        let mpp = test_mpp();
+        let signature = Signature::from([23u8; 64]).to_string();
+        let mut fence = mpp.test_fence().await;
+        assert!(fence
+            .store
+            .mark_failed(&fence.challenge_id, fence.generation, "taken over")
+            .await
+            .unwrap());
+
+        let err = fence.begin(&mpp, &signature).await.unwrap_err();
+        assert_eq!(err.code, Some("settlement-in-progress"), "{err:?}");
+        assert!(fence.pending.is_none());
+        mpp.consume_signature(&signature).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_failure_while_claiming_the_signature_sends_nothing() {
+        use std::sync::atomic::Ordering;
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rpc_url = stub_rpc_counting(
+            None,
+            Arc::new(std::sync::atomic::AtomicU8::new(1)),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            sends.clone(),
+            Arc::default(),
+        )
+        .await;
+        let store = Arc::new(FlakyStore {
+            inner: MemoryStore::new(),
+            prefix: "solana:consumed-signature:",
+            failing: std::sync::atomic::AtomicBool::new(true),
+            only_state: None,
+        });
+        let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
+            decimals: 9,
+            network: "devnet".to_string(),
+            rpc_url: Some(rpc_url),
+            store: Some(store.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let (credential, expected, _) = signed_pull_credential(&mpp, 11);
+        let err = mpp.verify(&credential, &expected).await.unwrap_err();
+        assert!(err.message.contains("injected store outage"), "{err:?}");
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "nothing may be broadcast");
+
+        // Once the store recovers the payer's next transaction settles once.
+        store.failing.store(false, Ordering::SeqCst);
+        let (credential, expected, signature) = signed_pull_credential(&mpp, 11);
+        let receipt = mpp.verify(&credential, &expected).await.unwrap();
+        assert_eq!(receipt.reference, signature.to_string());
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    /// JSON-RPC stub for a landed push payment: `getTransaction` returns a
+    /// confirmed SOL transfer of `lamports` from `sender` to `recipient`.
+    async fn stub_push_rpc(sender: Pubkey, recipient: Pubkey, lamports: u64) -> String {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| async move {
+                let result = match request["method"].as_str() {
+                    Some("getTransaction") => serde_json::json!({
+                        "slot": 1,
+                        "blockTime": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,
+                        "version": 0,
+                        "transaction": {
+                            "signatures": [request["params"][0]],
+                            "message": {
+                                "accountKeys": [
+                                    {"pubkey": sender.to_string(), "signer": true, "writable": true, "source": "transaction"},
+                                    {"pubkey": recipient.to_string(), "signer": false, "writable": true, "source": "transaction"},
+                                    {"pubkey": "11111111111111111111111111111111", "signer": false, "writable": false, "source": "transaction"},
+                                ],
+                                "recentBlockhash": Hash::new_unique().to_string(),
+                                "instructions": [{
+                                    "program": "system",
+                                    "programId": "11111111111111111111111111111111",
+                                    "parsed": {"type": "transfer", "info": {
+                                        "source": sender.to_string(),
+                                        "destination": recipient.to_string(),
+                                        "lamports": lamports,
+                                    }},
+                                    "stackHeight": null,
+                                }],
+                                "addressTableLookups": [],
+                            },
+                        },
+                        "meta": {
+                            "err": null, "status": {"Ok": null}, "fee": 5000,
+                            "preBalances": [10_000_000, 0, 1], "postBalances": [9_994_000, lamports, 1],
+                            "innerInstructions": [], "logMessages": [],
+                            "preTokenBalances": [], "postTokenBalances": [], "rewards": [],
+                            "loadedAddresses": {"writable": [], "readonly": []},
+                            "computeUnitsConsumed": 150,
+                        },
+                    }),
+                    other => panic!("unexpected RPC method {other:?}"),
+                };
+                Json(serde_json::json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    // A push charge records no pending broadcast, so no retry can reach
+    // confirm_pending: a landed push payment whose confirmed record cannot be
+    // written keeps its receipt (settlement-in-progress would never resolve).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_landed_push_charge_keeps_its_receipt_when_the_store_fails() {
+        let sender = seed_pubkey(13);
+        let recipient = Pubkey::from_str(TEST_RECIPIENT).unwrap();
+        let rpc_url = stub_push_rpc(sender, recipient, 1000).await;
+        let store = Arc::new(FlakyStore {
+            inner: MemoryStore::new(),
+            prefix: "solana-charge:record:",
+            failing: std::sync::atomic::AtomicBool::new(true),
+            only_state: Some("confirmed"),
+        });
+        let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
+            decimals: 9,
+            network: "devnet".to_string(),
+            rpc_url: Some(rpc_url),
+            accept_push_mode: true,
+            store: Some(store.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let expected = ChargeRequest {
+            amount: "1000".into(),
+            currency: "SOL".into(),
+            recipient: Some(TEST_RECIPIENT.into()),
+            method_details: Some(serde_json::json!({ "network": "devnet", "decimals": 9 })),
+            ..Default::default()
+        };
+        let signature = Signature::from([9u8; 64]).to_string();
+        let credential = build_credential(
+            &mpp,
+            &expected,
+            serde_json::json!({ "type": "signature", "signature": signature }),
+        );
+        let receipt = mpp.verify(&credential, &expected).await.unwrap();
+        assert_eq!(receipt.reference, signature);
+    }
+
+    // A charge that lands while its confirmed record cannot be written is
+    // still pending in the store. Answering with a receipt would let the
+    // retry's confirm_pending grant a second one: the retry is the receipt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_confirmation_the_store_cannot_record_issues_one_receipt() {
+        use std::sync::atomic::Ordering;
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rpc_url = stub_rpc_counting(
+            None,
+            Arc::new(std::sync::atomic::AtomicU8::new(1)),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            sends.clone(),
+            Arc::default(),
+        )
+        .await;
+        let store = Arc::new(FlakyStore {
+            inner: MemoryStore::new(),
+            prefix: "solana-charge:record:",
+            failing: std::sync::atomic::AtomicBool::new(true),
+            only_state: Some("confirmed"),
+        });
+        let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
+            decimals: 9,
+            network: "devnet".to_string(),
+            rpc_url: Some(rpc_url),
+            store: Some(store.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let (credential, expected, signature) = signed_pull_credential(&mpp, 12);
+        let err = mpp.verify(&credential, &expected).await.unwrap_err();
+        assert!(err.message.contains("could not be stored"), "{err:?}");
+
+        store.failing.store(false, Ordering::SeqCst);
+        let receipt = mpp.verify(&credential, &expected).await.unwrap();
+        assert_eq!(receipt.reference, signature.to_string());
+        assert!(
+            mpp.verify(&credential, &expected).await.is_err(),
+            "a second receipt"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 1, "one broadcast");
+    }
+
+    // A client signature that does not verify is refused before anything is
+    // claimed or sent. Otherwise a forged slot-0 signature (copied from any
+    // landed transaction) is refused by the node without preflight data, the
+    // charge is kept as possibly sent, and the retry reconciles on the status
+    // of the transaction that really owns that signature: a receipt for no
+    // payment.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forged_client_signature_is_refused_before_it_is_claimed() {
+        use std::sync::atomic::Ordering;
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rpc_url = stub_rpc_counting(
+            None,
+            // The forged signature's owner has landed.
+            Arc::new(std::sync::atomic::AtomicU8::new(1)),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            sends.clone(),
+            Arc::new(std::sync::Mutex::new(Some(serde_json::json!({
+                "code": -32003,
+                "message": "Transaction signature verification failure",
+            })))),
+        )
+        .await;
+        let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
+            decimals: 9,
+            network: "devnet".to_string(),
+            rpc_url: Some(rpc_url),
+            store: Some(Arc::new(MemoryStore::new())),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let (mut credential, expected, _) = signed_pull_credential(&mpp, 30);
+        let mut tx =
+            crate::core::tx::decode(credential.payload["transaction"].as_str().unwrap()).unwrap();
+        let forged = Signature::from([7u8; 64]);
+        tx.signatures[0] = forged;
+        credential.payload["transaction"] =
+            serde_json::json!(crate::core::tx::encode(&tx).unwrap());
+
+        for _ in 0..2 {
+            let err = mpp.verify(&credential, &expected).await.unwrap_err();
+            assert_ne!(err.code, Some("settlement-in-progress"), "{err:?}");
+            assert!(err.message.contains("signature verification"), "{err:?}");
+        }
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            0,
+            "a forged transaction is never sent"
+        );
+        mpp.consume_signature(&forged.to_string()).await.unwrap();
+    }
+
+    // The receipt names the transaction this server verified and sent, never
+    // whatever signature the RPC answers with. A mismatch leaves the outcome
+    // unknown, so the charge stays pending under the local signature.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpc_signature_for_another_transaction_is_not_receipted() {
+        use crate::mpp::store::ChargeRecordState;
+        let reported = Signature::from([14u8; 64]);
+        let rpc_url = stub_rpc(
+            Some(reported),
+            Arc::new(std::sync::atomic::AtomicU8::new(1)),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .await;
+        let store = Arc::new(MemoryStore::new());
+        let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
+            decimals: 9,
+            network: "devnet".to_string(),
+            rpc_url: Some(rpc_url),
+            store: Some(store.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let (credential, expected, local) = signed_pull_credential(&mpp, 15);
+        let err = mpp.verify(&credential, &expected).await.unwrap_err();
+        assert_eq!(err.code, Some("settlement-in-progress"), "{err:?}");
+        assert!(err.message.contains("different transaction"), "{err:?}");
+        let record = charge_record(&store, &credential.challenge.id).await;
+        assert_eq!(record.state, ChargeRecordState::Pending);
+        assert_eq!(
+            record.final_signature.as_deref(),
+            Some(local.to_string().as_str())
+        );
+
+        // When the RPC reports the transaction it was sent, it settles.
+        let honest = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
+            decimals: 9,
+            network: "devnet".to_string(),
+            rpc_url: Some(
+                stub_rpc(
+                    None,
+                    Arc::new(std::sync::atomic::AtomicU8::new(1)),
+                    Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                )
+                .await,
+            ),
+            store: Some(store.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let (credential, expected, signature) = signed_pull_credential(&honest, 16);
+        let receipt = honest.verify(&credential, &expected).await.unwrap();
+        assert_eq!(receipt.reference, signature.to_string());
+    }
+
+    // An owner whose lease was taken over before it began broadcasting is
+    // fenced out: it sends nothing and claims nothing, so the takeover is the
+    // only settlement and nothing it records can be overwritten.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_owner_cannot_begin_a_broadcast() {
+        let mpp = offline_sol_mpp();
+        let store = mpp.charge_replay_store();
+        let ChargeReservation::Reserved { generation } = store
+            .reserve("chal-fence", "digest", std::time::Duration::ZERO)
+            .await
+            .unwrap()
+        else {
+            panic!("fresh reservation");
+        };
+        let mut stale = BroadcastFence {
+            store: store.clone(),
+            challenge_id: "chal-fence".to_string(),
+            generation,
+            pending: None,
+        };
+        let ChargeReservation::Reserved { generation } = store
+            .reserve("chal-fence", "digest", CHARGE_RESERVATION_LEASE)
+            .await
+            .unwrap()
+        else {
+            panic!("expired lease is taken over");
+        };
+        let mut owner = BroadcastFence {
+            store,
+            challenge_id: "chal-fence".to_string(),
+            generation,
+            pending: None,
+        };
+
+        let err = stale.begin(&mpp, "sig-stale").await.unwrap_err();
+        assert_eq!(err.code, Some("settlement-in-progress"), "{err:?}");
+        mpp.consume_signature("sig-stale").await.unwrap();
+
+        // The current owner begins normally.
+        owner.begin(&mpp, "sig-owner").await.unwrap();
+        assert_eq!(owner.pending.as_deref(), Some("sig-owner"));
+        // The stale owner cannot claim the owner's signature, and so never
+        // touches its record.
+        let err = stale.begin(&mpp, "sig-owner").await.unwrap_err();
+        assert_eq!(err.code, Some("signature-consumed"), "{err:?}");
+        assert!(mpp.consume_signature("sig-owner").await.is_err());
+    }
+
+    // A send error other than a preflight rejection does not prove the node
+    // dropped the transaction (the response may be lost after it was
+    // accepted), so the charge stays pending under the locally derived
+    // signature and reconciles; only a preflight rejection fails it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ambiguous_send_error_is_pending_not_failed() {
+        use crate::mpp::store::ChargeRecordState;
+        use std::sync::atomic::Ordering;
+        let status = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let send_error = Arc::new(std::sync::Mutex::new(Some(serde_json::json!({
+            "code": -32099,
+            "message": "response lost after the node accepted the transaction",
+        }))));
+        let rpc_url = stub_rpc_counting(
+            None,
+            status.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Arc::default(),
+            send_error.clone(),
+        )
+        .await;
+        let store = Arc::new(MemoryStore::new());
+        let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
+            decimals: 9,
+            network: "devnet".to_string(),
+            rpc_url: Some(rpc_url),
+            store: Some(store.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let (credential, expected, signature) = signed_pull_credential(&mpp, 12);
+        let err = mpp.verify(&credential, &expected).await.unwrap_err();
+        assert_eq!(err.code, Some("settlement-in-progress"), "{err:?}");
+        let record = charge_record(&store, &credential.challenge.id).await;
+        assert_eq!(record.state, ChargeRecordState::Pending);
+        assert_eq!(
+            record.final_signature.as_deref(),
+            Some(signature.to_string().as_str())
+        );
+        // The transaction did land: the identical retry gets the receipt.
+        status.store(1, Ordering::SeqCst);
+        let receipt = mpp.verify(&credential, &expected).await.unwrap();
+        assert_eq!(receipt.reference, signature.to_string());
+
+        // A preflight rejection is definitive: failed, and the unsent
+        // transaction's claim is released.
+        *send_error.lock().unwrap() = Some(serde_json::json!({
+            "code": -32002,
+            "message": "Transaction simulation failed: Error processing Instruction 0",
+            "data": {
+                "err": { "InstructionError": [0, { "Custom": 1 }] },
+                "logs": ["Program failed"],
+                "accounts": null,
+                "unitsConsumed": 0,
+            },
+        }));
+        let (credential, expected, rejected) = signed_pull_credential(&mpp, 13);
+        let err = mpp.verify(&credential, &expected).await.unwrap_err();
+        assert!(err.message.contains("Simulation failed"), "{err:?}");
+        let record = charge_record(&store, &credential.challenge.id).await;
+        assert_eq!(record.state, ChargeRecordState::Failed);
+        mpp.consume_signature(&rejected.to_string()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ambiguous_confirmation_is_reconciled_to_a_receipt_on_retry() {
+        use std::sync::atomic::Ordering;
+        let (charge, first) = ambiguous_charge().await;
+        assert_eq!(first.code, Some("settlement-in-progress"), "{first:?}");
+        assert!(
+            first.message.contains("do not pay again"),
+            "{}",
+            first.message
+        );
+        let record = charge_record(&charge.store, &charge.credential.challenge.id).await;
+        assert_eq!(record.state, crate::mpp::store::ChargeRecordState::Pending);
+        assert_eq!(
+            record.final_signature.as_deref(),
+            Some(charge.signature.to_string().as_str())
+        );
+
+        // Still unknown: stays pending and never re-broadcasts.
+        let err = charge
+            .mpp
+            .verify(&charge.credential, &charge.expected)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some("settlement-in-progress"), "{err:?}");
+
+        // A different payload cannot claim the pending challenge.
+        let mut other = charge.credential.clone();
+        other.payload = serde_json::json!({ "type": "transaction", "transaction": "AA==" });
+        let err = charge
+            .mpp
+            .verify(&other, &charge.expected)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("already presented"), "{}", err.message);
+
+        // It landed: the identical retry returns the original receipt.
+        charge.status.store(1, Ordering::SeqCst);
+        let receipt = charge
+            .mpp
+            .verify(&charge.credential, &charge.expected)
+            .await
+            .unwrap();
+        assert_eq!(receipt.reference, charge.signature.to_string());
+        assert_eq!(receipt.challenge_id, charge.credential.challenge.id);
+        let record = charge_record(&charge.store, &charge.credential.challenge.id).await;
+        assert_eq!(
+            record.state,
+            crate::mpp::store::ChargeRecordState::Confirmed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_pending_retries_grant_one_receipt() {
+        use std::sync::atomic::Ordering;
+        let (charge, _) = ambiguous_charge().await;
+        let challenge_id = charge.credential.challenge.id.clone();
+        let record = charge_record(&charge.store, &challenge_id).await;
+        // A second retry that read the same pending generation before the
+        // first one confirmed it.
+        let replay = ChargeReplayStore::new(charge.store.clone());
+        let ChargeReservation::PendingConfirmation {
+            generation,
+            final_signature,
+        } = replay
+            .reserve(
+                &challenge_id,
+                &record.normalized_request_digest,
+                CHARGE_RESERVATION_LEASE,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected a pending record");
+        };
+        charge.status.store(1, Ordering::SeqCst);
+        let receipt = charge
+            .mpp
+            .verify(&charge.credential, &charge.expected)
+            .await
+            .unwrap();
+        assert_eq!(receipt.reference, charge.signature.to_string());
+
+        let err = charge
+            .mpp
+            .reconcile_pending_charge(&replay, &challenge_id, generation, &final_signature)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some("signature-consumed"), "{err:?}");
+
+        // Racing retries: exactly one is granted.
+        let (charge, _) = ambiguous_charge().await;
+        charge.status.store(1, Ordering::SeqCst);
+        let outcomes = tokio::join!(
+            charge.mpp.verify(&charge.credential, &charge.expected),
+            charge.mpp.verify(&charge.credential, &charge.expected),
+            charge.mpp.verify(&charge.credential, &charge.expected),
+        );
+        let granted = [outcomes.0.is_ok(), outcomes.1.is_ok(), outcomes.2.is_ok()];
+        assert_eq!(granted.iter().filter(|ok| **ok).count(), 1, "{outcomes:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_charge_reconciles_after_challenge_expiry() {
+        use std::sync::atomic::Ordering;
+        let deadline = time::OffsetDateTime::now_utc() + time::Duration::seconds(2);
+        let expires = deadline
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let (charge, first) = ambiguous_charge_expiring(Some(&expires)).await;
+        assert_eq!(first.code, Some("settlement-in-progress"), "{first:?}");
+        let remaining = deadline - time::OffsetDateTime::now_utc();
+        if remaining.is_positive() {
+            tokio::time::sleep(remaining.unsigned_abs() + std::time::Duration::from_millis(200))
+                .await;
+        }
+
+        // A different payload under the expired challenge settles nothing new.
+        let mut other = charge.credential.clone();
+        other.payload = serde_json::json!({ "type": "transaction", "transaction": "AA==" });
+        let err = charge
+            .mpp
+            .verify(&other, &charge.expected)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("expired"), "{}", err.message);
+
+        // The pending credential still reconciles past expiry.
+        let err = charge
+            .mpp
+            .verify(&charge.credential, &charge.expected)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some("settlement-in-progress"), "{err:?}");
+        charge.status.store(1, Ordering::SeqCst);
+        let receipt = charge
+            .mpp
+            .verify(&charge.credential, &charge.expected)
+            .await
+            .unwrap();
+        assert_eq!(receipt.reference, charge.signature.to_string());
+
+        // Once resolved, the expired challenge is refused again.
+        let err = charge
+            .mpp
+            .verify(&charge.credential, &charge.expected)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("expired"), "{}", err.message);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ambiguous_confirmation_fails_only_once_definitive() {
+        use std::sync::atomic::Ordering;
+        let (charge, _) = ambiguous_charge().await;
+        // The blockhash expired and the queried node has no status for the
+        // signature. That is not proof it never landed (the node may lag or
+        // lack history), so the charge stays pending and is never failed.
+        charge.blockhash_valid.store(false, Ordering::SeqCst);
+        let err = charge
+            .mpp
+            .verify(&charge.credential, &charge.expected)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some("settlement-in-progress"), "{err:?}");
+        let record = charge_record(&charge.store, &charge.credential.challenge.id).await;
+        assert_eq!(record.state, crate::mpp::store::ChargeRecordState::Pending);
+        // When the status does surface, the same retry is granted.
+        charge.status.store(1, Ordering::SeqCst);
+        let receipt = charge
+            .mpp
+            .verify(&charge.credential, &charge.expected)
+            .await
+            .unwrap();
+        assert_eq!(receipt.reference, charge.signature.to_string());
+
+        // An explicit on-chain failure is definitive.
+
+        let (charge, _) = ambiguous_charge().await;
+        charge.status.store(2, Ordering::SeqCst);
+        let err = charge
+            .mpp
+            .verify(&charge.credential, &charge.expected)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("landed on-chain but failed"),
+            "{}",
+            err.message
+        );
+        let record = charge_record(&charge.store, &charge.credential.challenge.id).await;
+        assert_eq!(record.state, crate::mpp::store::ChargeRecordState::Failed);
+    }
+
+    // ── Route binding ──
+
+    fn offline_sol_mpp() -> Mpp {
+        Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
+            decimals: 9,
+            network: "devnet".to_string(),
+            rpc_url: Some("http://127.0.0.1:1".to_string()),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn route_credential(mpp: &Mpp, route: Option<&str>) -> (PaymentCredential, ChargeRequest) {
+        let challenge = mpp
+            .charge_with_options(
+                "0.000001",
+                ChargeOptions {
+                    route,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let expected: ChargeRequest = challenge.request.decode().unwrap();
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::json!({ "type": "transaction", "transaction": "AA==" }),
+        );
+        (credential, expected)
+    }
+
+    // Two routes with identical payment terms on one backend: a credential
+    // issued for route A must not run route B's handler.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn route_bound_credential_only_verifies_on_its_route() {
+        let mpp = offline_sol_mpp();
+        let (credential, expected) = route_credential(&mpp, Some("GET api.example/a"));
+        for (route, rejected) in [
+            (Some("GET api.example/b"), true),
+            (Some("POST api.example/a"), true),
+            (Some("GET api.example/a/"), true),
+            (None, true),
+            (Some("GET api.example/a"), false),
+        ] {
+            let err = match route {
+                Some(route) => mpp
+                    .verify_credential_for_route(&credential, &expected, route)
+                    .await
+                    .unwrap_err(),
+                None => mpp
+                    .verify_credential_with_expected(&credential, &expected)
+                    .await
+                    .unwrap_err(),
+            };
+            assert_eq!(
+                err.message.contains("different route"),
+                rejected,
+                "route={route:?}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unbound_credential_is_rejected_by_a_route_bound_verifier() {
+        let mpp = offline_sol_mpp();
+        let (credential, expected) = route_credential(&mpp, None);
+        let err = mpp
+            .verify_credential_for_route(&credential, &expected, "GET api.example/a")
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("different route"), "{}", err.message);
+        let err = mpp
+            .verify_credential_with_expected(&credential, &expected)
+            .await
+            .unwrap_err();
+        assert!(!err.message.contains("different route"), "{}", err.message);
+    }
+
+    // The route lives in the HMAC-covered opaque: rewriting it fails auth.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tampered_route_binding_fails_authentication() {
+        let mpp = offline_sol_mpp();
+        let (mut credential, expected) = route_credential(&mpp, Some("GET api.example/a"));
+        credential.challenge.opaque = Some(route_opaque("GET api.example/b").unwrap());
+        let err = mpp
+            .verify_credential_for_route(&credential, &expected, "GET api.example/b")
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("Challenge ID mismatch"),
+            "{}",
+            err.message
+        );
+    }
+
+    // A worker on network B handed a challenge authenticated for network A
+    // (same secret, realm, recipient) with that challenge's own request must
+    // not settle it on B.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn credential_for_another_network_is_rejected() {
+        let server = |network: &str| {
+            Mpp::new(Config {
+                recipient: TEST_RECIPIENT.to_string(),
+                challenge_binding_secret: Some(TEST_SECRET.to_string()),
+                currency: "SOL".to_string(),
+                decimals: 9,
+                network: network.to_string(),
+                rpc_url: Some("http://127.0.0.1:1".to_string()),
+                realm: Some("test-realm".to_string()),
+                store: Some(Arc::new(MemoryStore::new())),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let issued = |network: Option<&str>| {
+            let mut details = serde_json::json!({ "decimals": 9 });
+            if let Some(network) = network {
+                details["network"] = serde_json::json!(network);
+            }
+            ChargeRequest {
+                amount: "1000".into(),
+                currency: "sol".into(),
+                recipient: Some(TEST_RECIPIENT.into()),
+                method_details: Some(details),
+                ..Default::default()
+            }
+        };
+        let devnet = server("devnet");
+        let request = issued(Some("devnet"));
+        let credential = build_credential(
+            &devnet,
+            &request,
+            serde_json::json!({ "type": "transaction", "transaction": "AA==" }),
+        );
+        let err = server("localnet")
+            .verify(&credential, &request)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("network 'devnet'"), "{}", err.message);
+        let err = devnet.verify(&credential, &request).await.unwrap_err();
+        assert!(!err.message.contains("network"), "{}", err.message);
+
+        // An omitted network means mainnet.
+        let challenge = PaymentChallenge::with_challenge_binding_secret_full(
+            TEST_SECRET,
+            "test-realm",
+            METHOD_NAME,
+            "charge",
+            Base64UrlJson::from_typed(&issued(None)).unwrap(),
+            Some(&crate::mpp::expires::minutes(5)),
+            None,
+            None,
+            None,
+        );
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::json!({ "type": "transaction", "transaction": "AA==" }),
+        );
+        let err = devnet.verify(&credential, &issued(None)).await.unwrap_err();
+        assert!(err.message.contains("network 'mainnet'"), "{}", err.message);
+        let err = server("mainnet")
+            .verify(&credential, &issued(None))
+            .await
+            .unwrap_err();
+        assert!(!err.message.contains("network"), "{}", err.message);
+    }
+
     // ── Replay protection tests ──
 
     #[tokio::test(flavor = "multi_thread")]
     async fn replay_protection_marks_and_detects_consumed() {
         let store = Arc::new(MemoryStore::new());
-        let _mpp = Mpp::new(Config {
+        let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             store: Some(store.clone()),
@@ -6963,15 +10121,10 @@ mod tests {
         })
         .unwrap();
 
-        let key = "solana-charge:consumed:testsig123";
-        // Not consumed yet.
-        assert!(store.get(key).await.unwrap().is_none());
-
-        // Mark as consumed.
-        store.put(key, serde_json::json!(true)).await.unwrap();
-
-        // Now it should be detected.
-        assert!(store.get(key).await.unwrap().is_some());
+        mpp.consume_signature("testsig123").await.unwrap();
+        let err = mpp.consume_signature("testsig123").await.unwrap_err();
+        assert_eq!(err.code, Some("signature-consumed"));
+        mpp.consume_signature("testsig456").await.unwrap();
     }
 
     // Concurrent-replay regression: race N tasks that all call the real
@@ -6988,6 +10141,7 @@ mod tests {
 
         let mpp = Arc::new(
             Mpp::new(Config {
+                realm: Some("test-realm".to_string()),
                 recipient: TEST_RECIPIENT.to_string(),
                 challenge_binding_secret: Some(TEST_SECRET.to_string()),
                 store: Some(Arc::new(MemoryStore::new())),
@@ -7049,6 +10203,7 @@ mod tests {
     async fn verify_identical_retry_after_confirmation_rejects_without_resettling() {
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             store: Some(store.clone()),
@@ -7078,7 +10233,7 @@ mod tests {
             .await
             .unwrap();
         replay_store
-            .mark_confirmed(&cred.challenge.id, "already-settled-signature")
+            .mark_confirmed(&cred.challenge.id, 0, "already-settled-signature")
             .await
             .unwrap();
 
@@ -7101,6 +10256,7 @@ mod tests {
     async fn verify_conflicting_retry_under_same_challenge_id_is_rejected() {
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             store: Some(store.clone()),
@@ -7129,7 +10285,7 @@ mod tests {
             .await
             .unwrap();
         replay_store
-            .mark_confirmed(&cred.challenge.id, "other-signature")
+            .mark_confirmed(&cred.challenge.id, 0, "other-signature")
             .await
             .unwrap();
 
@@ -7177,6 +10333,7 @@ mod tests {
     async fn verify_identical_retry_is_stable_even_when_callers_expected_request_drifts() {
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             store: Some(store.clone()),
@@ -7203,7 +10360,7 @@ mod tests {
             .await
             .unwrap();
         replay_store
-            .mark_confirmed(&cred.challenge.id, "already-settled-signature")
+            .mark_confirmed(&cred.challenge.id, 0, "already-settled-signature")
             .await
             .unwrap();
 
@@ -8642,12 +11799,14 @@ mod tests {
     #[test]
     fn charge_with_fee_payer_includes_method_details() {
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             fee_payer: true,
             // Audit #16: signer is now required alongside fee_payer = true.
             fee_payer_signer: Some(test_fee_payer_signer()),
             network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -8664,10 +11823,12 @@ mod tests {
         // Audit #16: per-call ChargeOptions.fee_payer requires the server
         // to have a signer configured.
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             fee_payer_signer: Some(test_fee_payer_signer()),
             network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -8690,12 +11851,14 @@ mod tests {
     fn charge_with_split_ata_creation_includes_method_details() {
         let split_recipient = Pubkey::new_unique();
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: crate::mpp::protocol::solana::mints::USDC_DEVNET.to_string(),
             fee_payer: true,
             fee_payer_signer: Some(test_fee_payer_signer()),
             network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -8733,12 +11896,14 @@ mod tests {
     fn charge_variants_with_options_returns_single_challenge() {
         let split_recipient = Pubkey::new_unique();
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: crate::mpp::protocol::solana::mints::USDC_DEVNET.to_string(),
             fee_payer: true,
             fee_payer_signer: Some(test_fee_payer_signer()),
             network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -8761,16 +11926,19 @@ mod tests {
         assert_eq!(challenges.len(), 1);
     }
 
+    // A configured symbol is resolved to its mint, so ATA creation splits work.
     #[test]
-    fn charge_with_split_ata_creation_rejects_symbol_currency() {
+    fn charge_with_split_ata_creation_accepts_configured_symbol() {
         let split_recipient = Pubkey::new_unique();
         let mpp = Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: "USDC".to_string(),
             fee_payer: true,
             fee_payer_signer: Some(test_fee_payer_signer()),
             network: "devnet".to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
@@ -8789,8 +11957,9 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .unwrap_err();
-        assert!(err.to_string().contains("mint address"));
+            .unwrap();
+        let request: ChargeRequest = err.request.decode().unwrap();
+        assert_eq!(request.currency, crate::core::mints::USDC_DEVNET);
     }
 
     // ── Method details include network and decimals ──
@@ -8803,5 +11972,132 @@ mod tests {
         let details = request.method_details.unwrap();
         assert_eq!(details["network"], "devnet");
         assert_eq!(details["decimals"], 6);
+    }
+
+    // RULINGS C2/C3: a SOL challenge carries neither `decimals` nor
+    // `tokenProgram`. Regression: `decimals` was always emitted.
+    #[test]
+    fn sol_charge_method_details_omit_decimals_and_token_program() {
+        let challenge = test_mpp_sol().charge("0.001").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        let details = request.method_details.unwrap();
+        assert_eq!(details["network"], "devnet");
+        assert!(details.get("decimals").is_none(), "{details}");
+        assert!(details.get("tokenProgram").is_none(), "{details}");
+    }
+
+    // Control: a mint challenge carries both.
+    #[test]
+    fn mint_charge_method_details_carry_decimals_and_token_program() {
+        let challenge = test_mpp().charge("1.00").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        let details = request.method_details.unwrap();
+        assert_eq!(details["decimals"], 6);
+        assert!(details.get("tokenProgram").is_some(), "{details}");
+    }
+
+    // ── RULINGS C1: wire currency is "sol" or a mint ──
+
+    fn mpp_with_currency(currency: &str, network: &str) -> Result<Mpp, Error> {
+        Mpp::new(Config {
+            realm: Some("test-realm".to_string()),
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: currency.to_string(),
+            network: network.to_string(),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
+            ..Default::default()
+        })
+    }
+
+    fn wire_currency_of(mpp: &Mpp) -> String {
+        let request: ChargeRequest = mpp.charge("0.01").unwrap().request.decode().unwrap();
+        request.currency
+    }
+
+    // Regression: the configured symbol used to go on the wire verbatim.
+    #[test]
+    fn configured_symbols_are_resolved_before_the_wire() {
+        for (currency, network, wire) in [
+            ("USDC", "devnet", crate::core::mints::USDC_DEVNET),
+            ("USDC", "mainnet", crate::core::mints::USDC_MAINNET),
+            ("usdc", "mainnet", crate::core::mints::USDC_MAINNET),
+            ("PYUSD", "mainnet", crate::core::mints::PYUSD_MAINNET),
+            ("SOL", "devnet", "sol"),
+            ("Sol", "mainnet", "sol"),
+        ] {
+            let mpp = mpp_with_currency(currency, network).unwrap();
+            assert_eq!(mpp.currency(), wire, "{currency}/{network}");
+            assert_eq!(wire_currency_of(&mpp), wire, "{currency}/{network}");
+        }
+    }
+
+    // Control: a mint address and "sol" pass through unchanged.
+    #[test]
+    fn configured_mint_and_sol_pass_through() {
+        let mint = crate::core::mints::USDC_DEVNET;
+        assert_eq!(
+            wire_currency_of(&mpp_with_currency(mint, "devnet").unwrap()),
+            mint
+        );
+        assert_eq!(
+            wire_currency_of(&mpp_with_currency("sol", "devnet").unwrap()),
+            "sol"
+        );
+    }
+
+    #[test]
+    fn configured_currency_that_is_neither_symbol_nor_mint_is_rejected() {
+        assert!(matches!(
+            mpp_with_currency("NOTACOIN", "devnet"),
+            Err(Error::InvalidConfig(_))
+        ));
+    }
+
+    // A caller-built request may name the configured symbol; the challenge
+    // still carries the wire form, and verification compares equal to it.
+    #[test]
+    fn caller_built_request_symbol_is_resolved_on_the_wire() {
+        let mpp = test_mpp();
+        let request = ChargeRequest {
+            amount: "500000".to_string(),
+            currency: "USDC".to_string(),
+            recipient: Some(TEST_RECIPIENT.to_string()),
+            ..Default::default()
+        };
+        let challenge = mpp.charge_challenge(&request).unwrap();
+        let issued: ChargeRequest = challenge.request.decode().unwrap();
+        assert_eq!(issued.currency, crate::core::mints::USDC_DEVNET);
+    }
+
+    // A credential whose issued request names a symbol is not one this
+    // server issued: it never matches the wire currency.
+    #[tokio::test]
+    async fn credential_with_symbol_currency_is_rejected() {
+        let mpp = test_mpp_sol();
+        let request = ChargeRequest {
+            amount: "1000".into(),
+            currency: "SOL".into(),
+            recipient: Some(TEST_RECIPIENT.into()),
+            method_details: Some(serde_json::json!({ "network": "devnet" })),
+            ..Default::default()
+        };
+        let challenge = PaymentChallenge::with_challenge_binding_secret_full(
+            TEST_SECRET,
+            "test-realm",
+            METHOD_NAME,
+            "charge",
+            Base64UrlJson::from_typed(&request).unwrap(),
+            Some(&crate::mpp::expires::minutes(5)),
+            None,
+            None,
+            None,
+        );
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::json!({ "type": "transaction", "transaction": "AA==" }),
+        );
+        let err = mpp.verify(&credential, &request).await.unwrap_err();
+        assert!(err.message.contains("Currency mismatch"), "{}", err.message);
     }
 }

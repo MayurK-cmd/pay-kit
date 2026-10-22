@@ -38,11 +38,13 @@ import { createLifecycle, type Lifecycle } from './session/lifecycle.js';
 import {
     OPEN_SLOT_WINDOW,
     PAYMENT_CHANNELS_PROGRAM_ID,
+    type SettleRpc,
     submitOpenTx,
     submitSettleAndDistribute,
     type SubmitSettleAndDistributeResult,
     submitTopUpTx,
     transactionSignatureFromWire,
+    treasuryOwnerForNetwork,
     verifyOpenTx,
 } from './session/on-chain.js';
 import {
@@ -149,6 +151,8 @@ export function session(parameters: session.Parameters) {
     const operator = operatorVoucherSigner?.address;
     const store = resolveSessionStore(parameters);
     const resolvedProgramId = (channelProgram ?? PAYMENT_CHANNELS_PROGRAM_ID) as Address;
+    // Settlement derives the treasury ATA per cluster; reject unknown networks up front.
+    treasuryOwnerForNetwork(network);
     const resolvedMint = resolveStablecoinMint(currency, network);
     if (!resolvedMint) throw new Error('session currency must be an SPL token mint; use wrapped SOL instead of SOL');
     const resolvedDecimals = decimals ?? (stablecoinSymbolForCurrency(resolvedMint) ? 6 : undefined);
@@ -579,6 +583,12 @@ async function handleOpen(args: HandleOpenArgs): Promise<Receipt.Receipt> {
     }
     const rentPayer = args.feePayer ? args.feePayerSigner?.address : payload.payer;
     if (!rentPayer) throw new Error('unable to determine channel rent payer');
+    // The sponsor co-signs as fee payer and rent payer; if it were also the
+    // channel payer, that one signature would authorize the deposit out of the
+    // sponsor's own token account. Mirrors `reject_sponsor_as_payer` in Rust.
+    if (args.feePayer && payload.payer === rentPayer) {
+        throw new Error('payment-channel payer must differ from the sponsored fee payer');
+    }
     const expected = {
         authorizedSigner: payload.authorizedSigner,
         channelProgram: args.programId.toString(),
@@ -840,10 +850,8 @@ async function handleVoucher(args: HandleVoucherArgs): Promise<Receipt.Receipt> 
             throw new Error(`${result.reason}: ${result.detail}`);
         }
         if (result.status === 'replayed') {
-            // An idempotent replay of the already-accepted highest voucher
-            // must not deliver additional service or debit spentAmount
-            // again — the client already paid for it.
-            return { ...current, lastActivityAt: Date.now() };
+            // Each voucher authorizes one request; a replay changes no state.
+            throw new Error('voucher was already accepted; sign a new voucher for this request');
         }
         if (result.newCumulative - current.spentAmount < args.price) {
             throw new Error('insufficient authorized voucher availability');
@@ -1015,6 +1023,15 @@ async function handleClose(args: HandleCloseArgs): Promise<Receipt.Receipt> {
             if (current.settledSignature === undefined) return current;
             throw new Error('Close already requested');
         }
+
+        // Uncommitted reservations are not billed. Here they come only from
+        // `POST /__402/session/deliveries`, which checks no credential and has
+        // no release: a reservation proves neither that the payer asked for
+        // it nor that anything was delivered, so billing it would let anyone
+        // who knows the channel id charge the payer (or block its close).
+        // Rust bills `PendingDelivery::owed_at_close` because there the host
+        // itself creates reservations for responses it sends; TypeScript has
+        // no such host-created reservation yet.
 
         if (args.payload.voucher) {
             const signed = normalizeSignedVoucher(args.payload.voucher);
@@ -1358,9 +1375,7 @@ async function closeAndSettleChannel(args: CloseAndSettleArgs): Promise<SubmitSe
 
         programId: args.programId,
         rentPayer: state.rentPayer,
-        rpc: args.rpc as unknown as {
-            sendTransaction: (wire: string, config?: unknown) => { send: () => Promise<Signature> };
-        },
+        rpc: args.rpc as unknown as SettleRpc,
         signer: args.merchantSigner as unknown as TransactionSigner,
         splits: args.splits ?? [],
         tokenProgram: args.tokenProgram,
